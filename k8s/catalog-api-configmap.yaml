@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: catalog-api-config
+data:
+  ASPNETCORE_ENVIRONMENT: "Development"
+  RABBITMQ_HOST: "rabbitmq"
+  Jwt__Issuer: "FCG.UsersAPI"
+  Jwt__Audience: "FCG.Client"

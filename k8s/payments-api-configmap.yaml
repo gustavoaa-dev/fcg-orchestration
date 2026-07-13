@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-api-config
+data:
+  ASPNETCORE_ENVIRONMENT: "Development"
+  RABBITMQ_HOST: "rabbitmq"

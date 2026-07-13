@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: users-api
+  labels:
+    app: users-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: users-api
+  template:
+    metadata:
+      labels:
+        app: users-api
+    spec:
+      containers:
+        - name: users-api
+          image: fcg-users-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: users-api-config
+          env:
+            - name: ConnectionStrings__DefaultConnection
+              valueFrom:
+                secretKeyRef:
+                  name: users-api-secret
+                  key: connection-string
+            - name: Jwt__SecretKey
+              valueFrom:
+                secretKeyRef:
+                  name: users-api-secret
+                  key: jwt-secret-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: users-api
+  labels:
+    app: users-api
+spec:
+  type: NodePort
+  selector:
+    app: users-api
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30001
