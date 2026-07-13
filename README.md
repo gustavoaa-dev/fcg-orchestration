@@ -1,6 +1,6 @@
 # FCG - Orquestração
 
-Repositório central de infraestrutura da plataforma **Facul Cloud Games**. Contém a configuração de containers Docker e os manifestos para deploy no Kubernetes.
+Repositório central de infraestrutura da plataforma **Fiap Cloud Games**. Contém a configuração de containers Docker e os manifestos para deploy no Kubernetes.
 
 ## Arquitetura
 
