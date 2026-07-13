@@ -1,0 +1,115 @@
+version: "3.8"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fcg-network
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlserver
+    ports:
+      - "1433:1433"
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "FCG@Password123"
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "FCG@Password123", "-C", "-Q", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fcg-network
+
+  users-api:
+    build:
+      context: ../fcg-users-api
+      dockerfile: Dockerfile
+    container_name: users-api
+    ports:
+      - "5001:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RABBITMQ_HOST: rabbitmq
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Users;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
+      Jwt__SecretKey: "fcg-secret-key-2024-super-segura-256bits"
+      Jwt__Issuer: "FCG.UsersAPI"
+      Jwt__Audience: "FCG.Client"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - fcg-network
+
+  catalog-api:
+    build:
+      context: ../fcg-catalog-api
+      dockerfile: Dockerfile
+    container_name: catalog-api
+    ports:
+      - "5002:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RABBITMQ_HOST: rabbitmq
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Catalog;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
+      Jwt__SecretKey: "fcg-secret-key-2024-super-segura-256bits"
+      Jwt__Issuer: "FCG.UsersAPI"
+      Jwt__Audience: "FCG.Client"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - fcg-network
+
+  payments-api:
+    build:
+      context: ../fcg-payments-api
+      dockerfile: Dockerfile
+    container_name: payments-api
+    ports:
+      - "5003:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RABBITMQ_HOST: rabbitmq
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Payments;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      sqlserver:
+        condition: service_healthy
+    networks:
+      - fcg-network
+
+  notifications-api:
+    build:
+      context: ../fcg-notifications-api
+      dockerfile: Dockerfile
+    container_name: notifications-api
+    ports:
+      - "5004:8080"
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - fcg-network
+
+networks:
+  fcg-network:
+    driver: bridge
