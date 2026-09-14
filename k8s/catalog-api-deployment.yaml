@@ -35,17 +35,17 @@ spec:
                   name: catalog-api-secret
                   key: jwt-secret-key
 ---
-apiVersion: v1
 kind: Service
+apiVersion: v1
 metadata:
   name: catalog-api
   labels:
     app: catalog-api
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: catalog-api
   ports:
-    - port: 80
+    - name: http
+      port: 80
       targetPort: 8080
-      nodePort: 30002

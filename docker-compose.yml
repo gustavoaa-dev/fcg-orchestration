@@ -36,8 +36,6 @@ services:
       context: ../fcg-users-api
       dockerfile: Dockerfile
     container_name: users-api
-    ports:
-      - "5001:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
@@ -58,8 +56,6 @@ services:
       context: ../fcg-catalog-api
       dockerfile: Dockerfile
     container_name: catalog-api
-    ports:
-      - "5002:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
@@ -80,8 +76,6 @@ services:
       context: ../fcg-payments-api
       dockerfile: Dockerfile
     container_name: payments-api
-    ports:
-      - "5003:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
@@ -99,8 +93,6 @@ services:
       context: ../fcg-notifications-api
       dockerfile: Dockerfile
     container_name: notifications-api
-    ports:
-      - "5004:8080"
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
