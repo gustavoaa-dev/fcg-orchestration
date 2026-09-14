@@ -444,7 +444,7 @@ curl -s "http://localhost:19090/api/v1/query?query=http_requests_received_total"
 
 ### Gerar tráfego para os painéis
 
-Os painéis ficam vazios enquanto não houver requisição: use o fluxo de [Acessar as APIs](#acessar-as-apis) — cadastro, login e chamadas autenticadas pelo gateway em `http://localhost:8000`. Cada execução movimenta `users-api` e `catalog-api`: as chamadas que chegam às APIs aparecem no painel de status code — inclusive as anônimas que falham por credencial, como `POST /api/auth/login` com senha errada, que aparecem como `401`. Os `401` rejeitados **no gateway** (chamadas sem token) **não** aparecem, porque o Kong responde antes de encaminhar: o gateway não é instrumentado nesta fase — a Opção A instrumenta `users-api` e `catalog-api`.
+Os painéis ficam vazios enquanto não houver requisição: use o fluxo de [Acessar as APIs](#acessar-as-apis) — cadastro, login e chamadas autenticadas pelo gateway em `http://localhost:8000`. Cada execução movimenta `users-api` e `catalog-api`: as chamadas que chegam às APIs aparecem no painel de status code — inclusive as anônimas que falham por credencial, como `POST /api/auth/login` de um usuário **existente** com a senha incorreta, que aparece como `401` (já o e-mail inexistente responde `400`, pelo contrato do endpoint). Os `401` rejeitados **no gateway** (chamadas sem token) **não** aparecem, porque o Kong responde antes de encaminhar: o gateway não é instrumentado nesta fase — a Opção A instrumenta `users-api` e `catalog-api`.
 
 ### Alterar o scrape exige restart do Prometheus
 
