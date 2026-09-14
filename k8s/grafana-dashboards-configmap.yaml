@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  labels:
+    app: grafana
+data:
+  fcg-apis.json: |
+    {
+      "uid": "fcg-apis",
+      "title": "FCG - APIs",
+      "tags": ["fcg", "observabilidade"],
+      "timezone": "browser",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "30s",
+      "time": { "from": "now-30m", "to": "now" },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Latencia das requisicoes (p50 / p95)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "p95",
+              "legendFormat": "p95 {{instance}}",
+              "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))"
+            },
+            {
+              "refId": "p50",
+              "legendFormat": "p50 {{instance}}",
+              "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Requisicoes por segundo",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "rps",
+              "legendFormat": "{{instance}}",
+              "expr": "sum by (instance) (rate(http_requests_received_total[5m]))"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Requisicoes por status code",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" } } }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "status",
+              "legendFormat": "{{code}}",
+              "expr": "sum by (code) (rate(http_requests_received_total[5m]))"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Taxa de erros (5xx / total)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "percent", "min": 0 }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "erros",
+              "legendFormat": "% 5xx",
+              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total[5m])), 1e-9)"
+            }
+          ]
+        }
+      ]
+    }
