@@ -506,7 +506,7 @@ As rotas passam pelo Kong como as demais (`/api/jogos`, JWT obrigatório) — **
 | Método e rota | Resposta |
 |---|---|
 | `PUT /api/jogos/{gameId}/avaliacoes` | `201` na primeira avaliação do usuário para aquele jogo e `200` ao atualizar (upsert por `(gameId, userId)`) |
-| `GET /api/jogos/{gameId}/avaliacoes` | Lista das avaliações do jogo, mais recentes primeiro |
+| `GET /api/jogos/{gameId}/avaliacoes` | Lista das avaliações do jogo, mais recentes primeiro (por `dataAtualizacao`) |
 | `GET /api/jogos/{gameId}/avaliacoes/resumo` | `{ "jogoId": "...", "total": 2, "notaMedia": 3.5 }` — com nenhuma avaliação, `total: 0` e `notaMedia` nulo |
 
 - Corpo do `PUT`: `{"nota": 5, "comentario": "opcional", "tags": ["acao"]}`; `nota` entre **1 e 5** (`400` fora da faixa ou com corpo inválido).
@@ -521,7 +521,7 @@ As rotas passam pelo Kong como as demais (`/api/jogos`, JWT obrigatório) — **
 - **Contadores `cache_hit` e `cache_miss`** no `/metrics`, coletados pelo Prometheus do SP2 (mesmo job `fcg-apis`). Atenção ao nome: o `prometheus-net` 8.2.1 expõe a série **exatamente como registrada, sem o sufixo `_total`** — no `/metrics` a linha é `cache_hit` seguida do valor, e **não** `cache_hit_total` (conferido em runtime; qualquer painel ou consulta tem de usar o nome cru).
 - **Frio x quente:** a primeira leitura vai ao SQL e a segunda vem do Redis, com o **corpo da resposta idêntico** nos dois casos (comparado em runtime, primeiro com o cache frio e depois quente). Numa medição real desta máquina: **32ms** no miss e **19ms** no hit.
 - **Degradação graciosa:** toda falha de cache é capturada e a leitura segue para o SQL — o Redis **não** derruba a API. Com o Redis fora do ar (`kubectl scale deployment/redis --replicas=0`), `GET /api/jogos`, `GET /api/jogos/{id}` e o `PUT` de avaliação continuam respondendo `200`, e o log traz `Falha ao ler a chave catalog:... do Redis; seguindo para o SQL Server.` na leitura e `Falha ao gravar a chave catalog:... no Redis; a resposta segue sem cache.` na gravação. O preço são os timeouts do cliente (2s por operação): a listagem medida nesse cenário levou **5,6s** antes de responder. Com o Redis de volta, as chaves são recriadas e o `cache_hit` volta a subir — não é preciso reiniciar o `catalog-api`.
-- **Inspecionar as chaves (armadilha):** o `IDistributedCache` grava o valor como **hash** (`HSET <chave> data/absexp/sldexp`), então `redis-cli GET <chave>` devolve `(nil)` **mesmo com a chave viva**. O falso negativo é do comando, não do cache — confira existência com `EXISTS`/`TYPE`/`HLEN`:
+- **Inspecionar as chaves (armadilha):** o `IDistributedCache` grava o valor como **hash** (`HSET <chave> data/absexp/sldexp`), então `redis-cli GET <chave>` devolve **`WRONGTYPE`** (a chave existe e é um hash; numa chave inexistente a saída é vazia). O erro não é do cache — confira com `EXISTS`/`TYPE`/`HLEN`:
 
 ```bash
 kubectl exec deploy/redis -- redis-cli exists catalog:games:all   # 1
@@ -565,6 +565,8 @@ Esperado: os dois pods `Running` e `Ready` (`1/1`), o PVC `mongo-data` em `Bound
 - **O `docker-compose.yml` não sobe Mongo nem Redis.** O caminho do Compose continua sendo apenas a infraestrutura de desenvolvimento (RabbitMQ e SQL Server) e as APIs; esta fase é contemplada **somente** pelo fluxo do cluster, documentado acima.
 - **Não há circuit breaker no cache.** Com o Redis fora, cada leitura cacheada paga os timeouts de conexão (2s por operação; 5,6s na listagem medida) antes de cair no SQL — a API responde certo, mas mais devagar enquanto o Redis estiver indisponível.
 - **O cache é do `catalog-api`.** A `users-api` não lê nem invalida chave alguma: `GET /api/usuarios` continua indo ao SQL a cada chamada.
+- **O `ErrorHandlingMiddleware` do `catalog-api` vaza stack trace e responde em PascalCase.** Ele devolve `Detalhe` com o **stack trace** da exceção e serializa o corpo como `StatusCode`/`Mensagem`/`Detalhe`, enquanto os controllers existentes respondem `{"mensagem": ...}` em camelCase. O defeito **já foi observado em runtime** no `401` de um token válido sem o claim `Id`, cuja resposta trouxe o stack trace com `AvaliacoesController.ObterUsuarioId()`.
+- **O scrape do Prometheus é estático por Service** (`users-api:80`, `catalog-api:80`), o que **pressupõe 1 réplica por API**: com 2+ réplicas ele raspa um pod aleatório por scrape e as réplicas colapsam numa única série — revisar ao escalar.
 
 ## Estrutura de arquivos
 
