@@ -26,7 +26,9 @@ spec:
             - name: KONG_PROXY_LISTEN
               value: 0.0.0.0:8000
             - name: KONG_ADMIN_LISTEN
-              value: 0.0.0.0:8001
+              value: 127.0.0.1:8001
+            - name: KONG_STATUS_LISTEN
+              value: 0.0.0.0:8100
             - name: KONG_PROXY_ACCESS_LOG
               value: /dev/stdout
             - name: KONG_ADMIN_ACCESS_LOG
@@ -42,16 +44,24 @@ spec:
               containerPort: 8000
             - name: admin
               containerPort: 8001
+            - name: status
+              containerPort: 8100
+          startupProbe:
+            httpGet:
+              path: /status/ready
+              port: status
+            periodSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet:
-              path: /status
-              port: admin
+              path: /status/ready
+              port: status
             initialDelaySeconds: 5
             periodSeconds: 5
           livenessProbe:
             httpGet:
               path: /status
-              port: admin
+              port: status
             initialDelaySeconds: 15
             periodSeconds: 10
           volumeMounts:
