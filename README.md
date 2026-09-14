@@ -583,7 +583,7 @@ O requisito da fase é **serverless**, e o que o caracteriza é o comportamento 
 
 ### Como funciona
 
-- **Escala:** o KEDA observa o tamanho das filas `notifications-user-created` e `notifications-payment-processed` e escala o Deployment da função de **0 a 2** réplicas (`minReplicaCount: 0`, `maxReplicaCount: 2`, `pollingInterval: 15`, `cooldownPeriod: 30`). Medido em runtime: um **cadastro real pelo gateway** acordou a função em **13s** e, passado o cooldown, ela **voltou a 0 réplicas**.
+- **Escala:** o KEDA observa o tamanho das filas `notifications-user-created` e `notifications-payment-processed` e escala o Deployment da função de **0 a 2** réplicas (`minReplicaCount: 0`, `maxReplicaCount: 2`, `pollingInterval: 15`, `cooldownPeriod: 30`). Medido em runtime: um **cadastro real pelo gateway** acordou a função em **~20-30s** (do cadastro até o pod ficar `Running` — **31s** na verificação final desta fase) e, passado o cooldown, ela **voltou a 0 réplicas**. É o tempo **observado** nas execuções desta fase, não uma latência prometida.
 - **Entrega:** chegando a mensagem, o RabbitMQ a entrega ao **`RabbitMQTrigger`** da função (`UserCreatedFunction` ou `PaymentProcessedFunction`) — não há chamada HTTP nesse caminho, a função é acordada pela fila.
 - **"Envio":** o efeito da função é **log estruturado**, com as mesmas mensagens do serviço removido — `[EMAIL ENVIADO] Boas-vindas para <Nome> - <email>` e `[EMAIL ENVIADO] Confirmação de compra para UserId: <guid>`. Medido no cadastro de evidência: `[EMAIL ENVIADO] Boas-vindas para Probe Escala Zero - escala194931@fcg.com`.
 
@@ -598,7 +598,7 @@ A função consome **filas próprias**, ligadas por binding aos exchanges **fano
 
 ### Erro e DLQ
 
-A função **não** captura a exceção de processamento, de propósito: a falha sobe, o trigger devolve a mensagem para **retry** e, esgotadas as tentativas, o **broker** encaminha a mensagem para a DLX `fcg-notifications-dlx`, que a deposita na DLQ `notifications-dead-letter`. As duas filas de entrada são declaradas com o argumento `x-dead-letter-exchange` apontando para essa DLX, então a DLQ é **real** em vez de teórica — vale para falha de negócio e para corpo que não desserializa.
+A função **não** captura a exceção de processamento, de propósito: a falha sobe, o trigger devolve a mensagem para **retry** e, esgotadas as **cinco tentativas**, o **broker** encaminha a mensagem para a DLX `fcg-notifications-dlx`, que a deposita na DLQ `notifications-dead-letter`. As duas filas de entrada são declaradas com o argumento `x-dead-letter-exchange` apontando para essa DLX, então a DLQ é **real** em vez de teórica — vale para falha de negócio e para corpo que não desserializa.
 
 ### Onde a função mora
 
@@ -615,11 +615,15 @@ A fila **`UserCreated`** (a do container antigo) fica **órfã** — ninguém ma
 kubectl exec deploy/rabbitmq -- rabbitmqctl delete_queue UserCreated
 ```
 
-A **`PaymentProcessed` não é tocada**: o `catalog-api` continua consumindo dela, é por ali que o jogo entra na biblioteca. O Terraform do repositório da função **não** remove a fila antiga (ele não apaga recurso que não gerencia), por isso o passo acima é manual. O Deployment em execução do serviço antigo também é removido à parte, porque o manifesto já saiu do git:
+A **`PaymentProcessed` não é tocada**: o `catalog-api` continua consumindo dela, é por ali que o jogo entra na biblioteca. O Terraform do repositório da função **não** remove a fila antiga (ele não apaga recurso que não gerencia), por isso o passo acima é manual. Os **objetos em execução** do serviço antigo também são removidos à parte, porque os manifestos já saíram do git: o `k8s/notifications-api-deployment.yaml` tinha **Deployment + Service**, e o `ConfigMap notifications-api-config` vinha do `k8s/notifications-api-configmap.yaml`:
 
 ```bash
-kubectl delete deployment notifications-api   # se ainda existir
+kubectl delete deployment notifications-api          # se ainda existir
+kubectl delete service notifications-api             # se ainda existir
+kubectl delete configmap notifications-api-config    # se ainda existir
 ```
+
+O `Service` e o `ConfigMap` sobrevivem ao `delete deployment`: nesta fase o `Service notifications-api` **ficou órfão** no cluster depois de o Deployment sair, e só foi embora com o comando acima — apagar o Deployment não apaga nenhum dos dois.
 
 ### Limitações conhecidas
 
