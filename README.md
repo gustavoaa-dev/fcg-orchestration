@@ -505,11 +505,12 @@ As rotas passam pelo Kong como as demais (`/api/jogos`, JWT obrigatório) — **
 
 | Método e rota | Resposta |
 |---|---|
-| `PUT /api/jogos/{gameId}/avaliacoes` | `201` na primeira avaliação do usuário para aquele jogo e `200` ao atualizar (upsert por `(gameId, userId)`) |
+| `PUT /api/jogos/{gameId}/avaliacoes` (o mesmo caminho também aceita `POST`) | `201` na primeira avaliação do usuário para aquele jogo e `200` ao atualizar (upsert por `(gameId, userId)`) |
 | `GET /api/jogos/{gameId}/avaliacoes` | Lista das avaliações do jogo, mais recentes primeiro (por `dataAtualizacao`) |
 | `GET /api/jogos/{gameId}/avaliacoes/resumo` | `{ "jogoId": "...", "total": 2, "notaMedia": 3.5 }` — com nenhuma avaliação, `total: 0` e `notaMedia` nulo |
 
-- Corpo do `PUT`: `{"nota": 5, "comentario": "opcional", "tags": ["acao"]}`; `nota` entre **1 e 5** (`400` fora da faixa ou com corpo inválido).
+- Corpo de ambos (`PUT` e `POST`): `{"nota": 5, "comentario": "opcional", "tags": ["acao"]}`; `nota` entre **1 e 5** (`400` fora da faixa ou com corpo inválido).
+- **O caminho aceita `POST` além de `PUT`:** a spec da disciplina escreve `POST /api/jogos/{gameId}/avaliacoes`, então os dois verbos chegam ao mesmo action — o `PUT` é a forma preferida por ser um upsert idempotente, e as duas respondem os **mesmos status** (`201` na criação, `200` na atualização) e recebem o **mesmo JSON**.
 - **O autor vem do claim `Id` do token, nunca do corpo:** um `usuarioId` enviado no JSON é ignorado (comportamento conferido em runtime), e um token válido que **não** traga o claim `Id` recebe `401`.
 - Demais contratos: `404` se o jogo não existir no SQL Server, `401` sem token.
 
