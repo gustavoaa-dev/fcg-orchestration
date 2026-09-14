@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: catalog-api
-          image: fcg-catalog-api:sp2
+          image: fcg-catalog-api:sp3-0fc433d
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -45,6 +45,11 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: catalog-api-secret
+                  key: connection-string
+            - name: Mongo__ConnectionString
+              valueFrom:
+                secretKeyRef:
+                  name: mongo-secret
                   key: connection-string
             - name: Jwt__SecretKey
               valueFrom:
