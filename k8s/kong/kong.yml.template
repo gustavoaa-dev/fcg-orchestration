@@ -1,0 +1,46 @@
+_format_version: "3.0"
+
+services:
+  - name: users-api
+    url: http://users-api:80
+    routes:
+      - name: users-login
+        paths:
+          - /api/auth
+        methods:
+          - POST
+        strip_path: false
+      - name: users-signup
+        paths:
+          - /api/usuarios
+        methods:
+          - POST
+        strip_path: false
+      - name: users-protegida
+        paths:
+          - /api/usuarios
+        methods:
+          - GET
+          - PUT
+          - PATCH
+          - DELETE
+        strip_path: false
+
+  - name: catalog-api
+    url: http://catalog-api:80
+    routes:
+      - name: catalog-jogos
+        paths:
+          - /api/jogos
+        strip_path: false
+      - name: catalog-biblioteca
+        paths:
+          - /api/biblioteca
+        strip_path: false
+
+consumers:
+  - username: fcg-client
+    jwt_secrets:
+      - key: FCG.UsersAPI
+        algorithm: HS256
+        secret: ${JWT_SECRET}
