@@ -35,17 +35,17 @@ spec:
                   name: users-api-secret
                   key: jwt-secret-key
 ---
-apiVersion: v1
 kind: Service
+apiVersion: v1
 metadata:
   name: users-api
   labels:
     app: users-api
 spec:
-  type: NodePort
+  type: ClusterIP
   selector:
     app: users-api
   ports:
-    - port: 80
+    - name: http
+      port: 80
       targetPort: 8080
-      nodePort: 30001
