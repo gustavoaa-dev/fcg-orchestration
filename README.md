@@ -4,21 +4,21 @@ Repositório central de infraestrutura da plataforma **Fiap Cloud Games**. Cont�
 
 ## Arquitetura
 
-A plataforma é composta por 4 microsserviços independentes que se comunicam de forma assíncrona via RabbitMQ:
+A plataforma é composta por 3 microsserviços independentes que se comunicam de forma assíncrona via RabbitMQ, mais a **função serverless** de notificações — o antigo serviço `notifications-api` foi substituído nesta fase por uma função com **escala a zero** (ver [Serverless](#serverless-função-de-notificações)):
 
 | Serviço | Repositório | Responsabilidade |
 |---|---|---|
 | UsersAPI | [fcg-users-api](https://github.com/gustavoaa-dev/fcg-users-api) | Cadastro e autenticação de usuários |
 | CatalogAPI | [fcg-catalog-api](https://github.com/gustavoaa-dev/fcg-catalog-api) | Catálogo de jogos e biblioteca |
 | PaymentsAPI | [fcg-payments-api](https://github.com/gustavoaa-dev/fcg-payments-api) | Processamento de pagamentos |
-| NotificationsAPI | [fcg-notifications-api](https://github.com/gustavoaa-dev/fcg-notifications-api) | Envio de notificações |
+| Notificações | [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function) | Envio de notificações — **função com escala a zero** (KEDA), sem porta publicada |
 
 Todo o acesso externo passa pelo **API Gateway (Kong)** — em `http://localhost:8000` quando o `EXTERNAL-IP` do `svc/kong` for `localhost` ou com o `port-forward` ativo, e em `http://<EXTERNAL-IP>:8000` quando o cluster entregar um IP de rede (ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)): as APIs **não** são publicadas diretamente. Detalhes em [API Gateway (Kong)](#api-gateway-kong).
 
 ### Fluxo de eventos
 
 ```
-UsersAPI ──UserCreatedEvent──→ NotificationsAPI (boas-vindas)
+UsersAPI ──UserCreatedEvent──→ Função de notificações (boas-vindas)
 
 CatalogAPI ──OrderPlacedEvent──→ PaymentsAPI (processa pagamento)
                                       │
@@ -26,7 +26,7 @@ CatalogAPI ──OrderPlacedEvent──→ PaymentsAPI (processa pagamento)
                                       │
                     ┌─────────────────┴─────────────────┐
                     ↓                                   ↓
-            CatalogAPI (adiciona à biblioteca)   NotificationsAPI (confirmação)
+            CatalogAPI (adiciona à biblioteca)   Função de notificações (confirmação)
 ```
 
 ## Como executar com Docker
@@ -39,13 +39,14 @@ CatalogAPI ──OrderPlacedEvent──→ PaymentsAPI (processa pagamento)
 ### Subir a aplicação
 
 ```bash
-# Clonar este repositório e os 4 microsserviços no mesmo diretório pai:
+# Clonar este repositório e os 3 microsserviços das APIs no mesmo diretório pai:
 # .
 # ├── fcg-orchestration/
 # ├── fcg-users-api/
 # ├── fcg-catalog-api/
-# ├── fcg-payments-api/
-# └── fcg-notifications-api/
+# └── fcg-payments-api/
+# (a notificação não entra aqui: ela não é mais um container do Compose e sim uma
+#  função serverless, implantada no cluster pelo Terraform de fcg-notifications-function)
 
 cd fcg-orchestration
 docker-compose up -d
@@ -70,6 +71,8 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 > Prometheus e Grafana também ficam **fechados dentro do cluster**: o gateway Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), e os dois Services são `ClusterIP` sem `EXTERNAL-IP` — chega-se a eles só por `port-forward`, nas portas locais `19090` e `13000` (ver [Observabilidade](#observabilidade)).
 
 > O mesmo vale para o **MongoDB e o Redis**: os dois são `ClusterIP` sem `EXTERNAL-IP` e **não** têm rota no Kong — quem fala com eles é o `catalog-api`, por `mongo:27017` e `redis:6379`, de dentro do cluster. Para inspecionar de fora, o caminho é `port-forward` (ver [Persistência poliglota e cache](#persistência-poliglota-e-cache)).
+
+> **A notificação não tem porta nem Service** e por isso não tem linha nesta tabela: ela deixou de ser um container sempre ligado (`ClusterIP` na porta `80`) e virou uma **função com escala a zero**, sem superfície HTTP — o gatilho dela é a fila, não uma requisição. Também não subiu no Compose: quem implanta a função é o Terraform do repositório dela (ver [Serverless](#serverless-função-de-notificações)).
 
 ### Parar a aplicação
 
@@ -96,10 +99,11 @@ As imagens são buildadas **localmente** (não há registry) e o cluster as cons
 docker build -t fcg-users-api:sp2 .
 docker build -t fcg-catalog-api:sp2 .
 docker build -t fcg-payments-api:latest .
-docker build -t fcg-notifications-api:latest .
 ```
 
-> **Convenção de tag: cada rebuild exige uma tag nova.** As APIs instrumentadas nesta fase usam tag **versionada por fase** — as duas APIs revisadas no SP2 (`users-api` e `catalog-api`) são buildadas como `fcg-users-api:sp2` e `fcg-catalog-api:sp2`, e é exatamente essa tag que está declarada em `k8s/users-api-deployment.yaml` e `k8s/catalog-api-deployment.yaml` (`payments-api` e `notifications-api` ainda usam `:latest`). Com `imagePullPolicy: IfNotPresent` **rebuildar a mesma tag não atualiza o pod**: o kubelet encontra a imagem daquela tag já presente no nó e reutiliza a antiga, sem novo pull — o `kubectl rollout restart` sobe de novo, mas com o binário velho. Publicar alteração de código é, portanto, sempre um passo de três partes: **buildar com tag nova** (`:sp3`), **trocar a tag no manifesto** e **reaplicar** — `docker build -t fcg-users-api:sp3 .`, editar `image:` em `k8s/users-api-deployment.yaml` e `kubectl apply -f k8s/users-api-deployment.yaml`. Se você alterar `payments-api` ou `notifications-api`, a mesma regra vale — tag nova por rebuild (hoje elas ainda estão em `:latest`, e é justamente por isso que um rebuild delas não chega ao pod). (É por isso que os comandos acima não usam `-t fcg-users-api .`, que gera a tag móvel `:latest`: ela não distingue duas revisões e o pod passa a rodar código diferente do que o git descreve.)
+> **Convenção de tag: cada rebuild exige uma tag nova.** As APIs instrumentadas nesta fase usam tag **versionada por fase** — as duas APIs revisadas no SP2 (`users-api` e `catalog-api`) são buildadas como `fcg-users-api:sp2` e `fcg-catalog-api:sp2`, e é exatamente essa tag que está declarada em `k8s/users-api-deployment.yaml` e `k8s/catalog-api-deployment.yaml` (`payments-api` ainda usa `:latest`). Com `imagePullPolicy: IfNotPresent` **rebuildar a mesma tag não atualiza o pod**: o kubelet encontra a imagem daquela tag já presente no nó e reutiliza a antiga, sem novo pull — o `kubectl rollout restart` sobe de novo, mas com o binário velho. Publicar alteração de código é, portanto, sempre um passo de três partes: **buildar com tag nova** (`:sp3`), **trocar a tag no manifesto** e **reaplicar** — `docker build -t fcg-users-api:sp3 .`, editar `image:` em `k8s/users-api-deployment.yaml` e `kubectl apply -f k8s/users-api-deployment.yaml`. Se você alterar `payments-api`, a mesma regra vale — tag nova por rebuild (hoje ele ainda está em `:latest`, e é justamente por isso que um rebuild dele não chega ao pod). (É por isso que os comandos acima não usam `-t fcg-users-api .`, que gera a tag móvel `:latest`: ela não distingue duas revisões e o pod passa a rodar código diferente do que o git descreve.)
+
+> A imagem da **função de notificações** não é buildada daqui: ela tem repositório próprio (`fcg-notifications-function`) e a tag `sp4-<sha7>` é passada ao `terraform apply` (ver [Serverless](#serverless-função-de-notificações)).
 
 ### Aplicar os manifestos
 
@@ -569,6 +573,59 @@ Esperado: os dois pods `Running` e `Ready` (`1/1`), o PVC `mongo-data` em `Bound
 - **O `ErrorHandlingMiddleware` do `catalog-api` vaza stack trace e responde em PascalCase.** Ele devolve `Detalhe` com o **stack trace** da exceção e serializa o corpo como `StatusCode`/`Mensagem`/`Detalhe`, enquanto os controllers existentes respondem `{"mensagem": ...}` em camelCase. O defeito **já foi observado em runtime** no `401` de um token válido sem o claim `Id`, cuja resposta trouxe o stack trace com `AvaliacoesController.ObterUsuarioId()`.
 - **O scrape do Prometheus é estático por Service** (`users-api:80`, `catalog-api:80`), o que **pressupõe 1 réplica por API**: com 2+ réplicas ele raspa um pod aleatório por scrape e as réplicas colapsam numa única série — revisar ao escalar.
 
+## Serverless (função de notificações)
+
+Nesta fase a notificação deixou de ser um **serviço sempre ligado** e passou a ser uma **função com escala a zero**. O que existia antes — o `notifications-api`, um Deployment com um container .NET consumindo fila 24/7 e um `ClusterIP` na porta `80` — **saiu deste repositório**: `k8s/notifications-api-deployment.yaml` (Deployment + Service), `k8s/notifications-api-configmap.yaml` (o `envFrom` dele) e o bloco `notifications-api` do `docker-compose.yml` foram removidos. No lugar entrou uma **Azure Function com isolated worker .NET 8**, do repositório [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function), rodando no mesmo cluster e escalando de zero.
+
+### Por que
+
+O requisito da fase é **serverless**, e o que o caracteriza é o comportamento em repouso: a função fica em **0 réplicas** quando não há evento e sobe sozinha quando chega mensagem. Um `Deployment` comum não faz isso — ele é um processo sempre no ar, pagando container, CPU e memória enquanto não há nada para notificar. Medido neste cluster: com as filas vazias **nenhum pod** da função existe, e o `terraform plan` feito com a função em zero devolve **"No changes. Your infrastructure matches the configuration."** — o Terraform não briga com o KEDA pelo número de réplicas.
+
+### Como funciona
+
+- **Escala:** o KEDA observa o tamanho das filas `notifications-user-created` e `notifications-payment-processed` e escala o Deployment da função de **0 a 2** réplicas (`minReplicaCount: 0`, `maxReplicaCount: 2`, `pollingInterval: 15`, `cooldownPeriod: 30`). Medido em runtime: um **cadastro real pelo gateway** acordou a função em **13s** e, passado o cooldown, ela **voltou a 0 réplicas**.
+- **Entrega:** chegando a mensagem, o RabbitMQ a entrega ao **`RabbitMQTrigger`** da função (`UserCreatedFunction` ou `PaymentProcessedFunction`) — não há chamada HTTP nesse caminho, a função é acordada pela fila.
+- **"Envio":** o efeito da função é **log estruturado**, com as mesmas mensagens do serviço removido — `[EMAIL ENVIADO] Boas-vindas para <Nome> - <email>` e `[EMAIL ENVIADO] Confirmação de compra para UserId: <guid>`. Medido no cadastro de evidência: `[EMAIL ENVIADO] Boas-vindas para Probe Escala Zero - escala194931@fcg.com`.
+
+### Contrato das filas
+
+| Fila consumida pela função | Exchange **fanout** de origem | Quem publica |
+|---|---|---|
+| `notifications-user-created` | `UserCreatedEvent` | `users-api` (cadastro) |
+| `notifications-payment-processed` | `PaymentProcessedEvent` | `payments-api` (pagamento processado) |
+
+A função consome **filas próprias**, ligadas por binding aos exchanges **fanout** de origem: o acoplamento é com o **exchange** e com o **JSON do evento** — **nunca** com o nome da fila. É isso que permite a cada interessado ter a sua própria fila ligada ao mesmo exchange. No serviço antigo, a notificação e o `catalog-api` disputavam a **mesma** fila `PaymentProcessed` (consumidores concorrentes), então cada evento ia para **um** dos dois e a notificação podia simplesmente não acontecer; com fila própria, cada um recebe a sua cópia. O formato do corpo — o envelope do MassTransit, com o contrato dentro de `message` — está detalhado no README do repositório da função.
+
+### Erro e DLQ
+
+A função **não** captura a exceção de processamento, de propósito: a falha sobe, o trigger devolve a mensagem para **retry** e, esgotadas as tentativas, o **broker** encaminha a mensagem para a DLX `fcg-notifications-dlx`, que a deposita na DLQ `notifications-dead-letter`. As duas filas de entrada são declaradas com o argumento `x-dead-letter-exchange` apontando para essa DLX, então a DLQ é **real** em vez de teórica — vale para falha de negócio e para corpo que não desserializa.
+
+### Onde a função mora
+
+- **Repositório:** [`fcg-notifications-function`](https://github.com/gustavoaa-dev/fcg-notifications-function) — código C#, `Dockerfile`, `host.json` e Terraform próprios.
+- **Implantação:** o **`terraform apply` daquele repositório**, que declara o `Deployment notifications-function` (imagem `fcg-notifications-function:sp4-<sha7>`), o `TriggerAuthentication` e o `ScaledObject`. **Nenhum manifesto da função é aplicado a partir deste repositório** — um `kubectl apply -f k8s/` daqui **não** implanta a função.
+- **KEDA:** instalado **à parte**, pelo manifesto oficial da release **v2.20.2** (`keda-2.20.2.yaml`), no namespace `keda` — o procedimento está em [`k8s/keda/README.md`](k8s/keda/README.md). O Terraform da função **não** instala o operador: ele apenas declara objetos `keda.sh/v1alpha1`, e por isso o `apply` exige a CRD já presente no cluster.
+- **Segredo:** o `ScaledObject` lê o host AMQP do `Secret rabbitmq-connection` (chave `host`), e o valor tem de ser o **nome completo** — `amqp://guest:guest@rabbitmq.default.svc.cluster.local:5672`. O operador do KEDA roda no namespace `keda` e **nome curto não cruza namespace**: com `rabbitmq:5672` o scaler falha com `dial tcp: lookup rabbitmq ...: server misbehaving` e o `ScaledObject` fica `Ready=False` (escala a zero quebrada); o FQDN resolve de dentro e de fora do `default`.
+
+### Limpeza da migração
+
+A fila **`UserCreated`** (a do container antigo) fica **órfã** — ninguém mais a consome — e deve ser removida à mão:
+
+```bash
+kubectl exec deploy/rabbitmq -- rabbitmqctl delete_queue UserCreated
+```
+
+A **`PaymentProcessed` não é tocada**: o `catalog-api` continua consumindo dela, é por ali que o jogo entra na biblioteca. O Terraform do repositório da função **não** remove a fila antiga (ele não apaga recurso que não gerencia), por isso o passo acima é manual. O Deployment em execução do serviço antigo também é removido à parte, porque o manifesto já saiu do git:
+
+```bash
+kubectl delete deployment notifications-api   # se ainda existir
+```
+
+### Limitações conhecidas
+
+- **A fila antiga não é removida automaticamente**: o Terraform do repositório da função não apaga recurso que não gerencia, então a `UserCreated` só sai com o `delete_queue` mostrado acima.
+- **A função não expõe `/metrics` nesta fase:** não é possível raspar uma função em **0 réplicas** (não há pod para o Prometheus alcançar, e quem manda no número de réplicas é o KEDA), e o requisito de observabilidade da fase já é atendido por `users-api` e `catalog-api` — alvos e dashboard seguem como em [Observabilidade](#observabilidade).
+
 ## Estrutura de arquivos
 
 ```
@@ -588,13 +645,13 @@ fcg-orchestration/
 │   ├── payments-api-configmap.yaml
 │   ├── payments-api-secret.yaml
 │   ├── payments-api-deployment.yaml
-│   ├── notifications-api-configmap.yaml
-│   ├── notifications-api-deployment.yaml
 │   ├── prometheus-configmap.yaml
 │   ├── prometheus-deployment.yaml
 │   ├── grafana-configmap.yaml
 │   ├── grafana-dashboards-configmap.yaml
 │   ├── grafana-deployment.yaml
+│   ├── keda/
+│   │   └── README.md                 # procedimento do operador do KEDA (a função é implantada pelo Terraform do repo dela)
 │   └── kong/
 │       ├── kong-deployment.yaml      # Deployment + Service (proxy 8000; Admin 8001 e Status 8100 só no pod)
 │       └── kong.yml.template         # config declarativa com o marcador ${JWT_SECRET}
