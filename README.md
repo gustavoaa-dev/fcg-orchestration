@@ -57,7 +57,7 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 
 | Serviço | Porta | Observação |
 |---|---|---|
-| Kong (gateway) | `http://localhost:8000` | Único ponto de entrada das APIs (Kubernetes) |
+| Kong (gateway) | `http://localhost:8000` | Único ponto de entrada das APIs (Kubernetes; ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)) |
 | RabbitMQ Management | `http://localhost:15672` (guest/guest) | Infraestrutura de desenvolvimento |
 | SQL Server | `localhost:1433` (sa/FCG@Password123) | Infraestrutura de desenvolvimento |
 
@@ -73,8 +73,11 @@ docker-compose down
 
 ### Pré-requisitos
 
-- Cluster Kubernetes (Docker Desktop, Kind ou Minikube)
+- Cluster Kubernetes — a decisão do projeto é **Docker Desktop**; Kind e Minikube também funcionam, com as ressalvas de [exposição do gateway](#expor-o-gateway-porta-de-entrada)
 - kubectl configurado
+- Para executar os exemplos de chamada HTTP deste README, escolha **uma** das duas variantes equivalentes — as duas fazem o mesmo fluxo `cadastro → login → rota protegida`:
+  - **PowerShell nativo** — usa `Invoke-RestMethod`, sem dependências extras; roda em qualquer Windows, inclusive **Windows PowerShell 5.1** (é a variante usada neste projeto);
+  - **bash** — exige **Git Bash** ou **WSL**, com **`curl`** e **`jq`** instalados (o `jq` é o que extrai o token do JSON).
 
 ### Build das imagens
 
@@ -114,6 +117,29 @@ powershell -File scripts/deploy-kong.ps1
 
 **Sem esse restart a mudança de configuração não vale**: em modo DB-less o Kong carrega a config declarativa na inicialização do pod.
 
+### Expor o gateway (porta de entrada)
+
+O Service do Kong é `LoadBalancer`, e nem todo cluster entrega um `EXTERNAL-IP` local — confira sempre:
+
+```bash
+kubectl get svc kong
+```
+
+| Cluster | `EXTERNAL-IP` do `svc/kong` | Como chegar em `http://localhost:8000` |
+|---|---|---|
+| **Docker Desktop** (decisão do projeto) | `localhost` | direto, sem passo extra |
+| **Minikube** | `<pending>` | rodar `minikube tunnel` em um terminal separado e mantê-lo aberto |
+| **Kind** | `<pending>` (não há load balancer) | usar o `port-forward` abaixo |
+| Qualquer cluster | `<pending>` | **fallback universal:** `kubectl port-forward svc/kong 8000:8000` |
+
+```bash
+# Fallback universal: funciona em qualquer cluster, com ou sem EXTERNAL-IP.
+# Deixe rodando em um terminal separado — a URL segue sendo http://localhost:8000.
+kubectl port-forward svc/kong 8000:8000
+```
+
+Como o Kong publica apenas a porta `8000` (a Admin API `8001` não é exposta), o `port-forward` do proxy não conflita com o da Admin API documentado em [Depurar (port-forward)](#depurar-port-forward).
+
 ### Verificar o deploy
 
 ```bash
@@ -126,25 +152,80 @@ Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` de
 
 Confirme também que as APIs ficaram fechadas: `users-api` e `catalog-api` aparecem como `ClusterIP` e **não existe mais `NodePort`** (as antigas `30001`/`30002` não respondem).
 
+E confirme a exposição do gateway em `kubectl get svc kong`:
+
+- `EXTERNAL-IP` = `localhost` → o gateway já responde em `http://localhost:8000` (caso do Docker Desktop);
+- `EXTERNAL-IP` = `<pending>` → aplique o passo de exposição do cluster (`minikube tunnel`) ou o **fallback universal** `kubectl port-forward svc/kong 8000:8000` antes de seguir para os exemplos.
+
 ### Acessar as APIs
 
-Tudo passa pelo gateway: **`http://localhost:8000`**.
+Tudo passa pelo gateway: **`http://localhost:8000`** — com Docker Desktop direto, ou via o `port-forward svc/kong 8000:8000` descrito acima nos demais clusters.
+
+O fluxo é **autocontido** e sempre na mesma sessão do terminal: **cadastrar → logar (capturando o token) → chamar a rota protegida**. O token não é reaproveitado entre passos nem entre blocos.
+
+#### Variante A — PowerShell nativo (Windows, sem dependências)
+
+```powershell
+# 1) Cadastro (POST /api/usuarios é rota ANÔNIMA). Senha: mínimo de 8 caracteres,
+#    com ao menos uma letra, um dígito e um caractere especial. Esperado: 201.
+$corpoCadastro = @{ nome = "Jogador FCG"; email = "jogador@fcg.com"; senha = "Senha@123" } | ConvertTo-Json
+try {
+    Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/usuarios `
+        -ContentType "application/json" -Body $corpoCadastro | Out-Null
+    Write-Host "cadastro=201"
+} catch {
+    # 400 = e-mail já cadastrado (rodada repetida) ou payload inválido
+    Write-Host "cadastro=$($_.Exception.Response.StatusCode.value__)"
+}
+
+# 2) Login (POST /api/auth/login é rota ANÔNIMA) e captura do token NA MESMA SESSÃO.
+$corpoLogin = @{ email = "jogador@fcg.com"; senha = "Senha@123" } | ConvertTo-Json
+$token = (Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/auth/login `
+    -ContentType "application/json" -Body $corpoLogin).token
+
+# 3) Rota protegida SEM token -> o gateway responde 401
+try {
+    Invoke-WebRequest -Uri http://localhost:8000/api/jogos -UseBasicParsing | Out-Null
+    Write-Host "sem-token=200 (inesperado)"
+} catch {
+    Write-Host "sem-token=$($_.Exception.Response.StatusCode.value__)"
+}
+
+# 4) Rota protegida COM token -> 200
+$respostaComToken = Invoke-WebRequest -Uri http://localhost:8000/api/jogos `
+    -Headers @{ Authorization = "Bearer $token" } -UseBasicParsing
+Write-Host "com-token=$($respostaComToken.StatusCode)"
+```
+
+Esperado: `cadastro=201`, `sem-token=401`, `com-token=200` (numa segunda execução, `cadastro=400` — o usuário já existe — e o restante igual).
+
+> No Windows PowerShell 5.1, o `Invoke-WebRequest` sem `-UseBasicParsing` depende do Internet Explorer; os exemplos acima já passam `-UseBasicParsing`.
+
+#### Variante B — bash (`curl` + `jq`, em Git Bash ou WSL)
 
 ```bash
-# Sem token: bloqueado pelo próprio gateway
-curl -s -o /dev/null -w "sem-token=%{http_code}\n" http://localhost:8000/api/jogos
+# 1) Cadastro (rota ANÔNIMA). Esperado: 201
+curl -s -o /dev/null -w "cadastro=%{http_code}\n" -X POST http://localhost:8000/api/usuarios \
+  -H "Content-Type: application/json" \
+  -d '{"nome":"Jogador FCG","email":"jogador@fcg.com","senha":"Senha@123"}'
 
-# Login + chamada autenticada no MESMO bloco (o token não é reaproveitado entre blocos;
-# reautentique sempre que for testar). Ajuste e-mail/senha para um usuário cadastrado.
+# 2) Login (rota ANÔNIMA) e captura do token NO MESMO BLOCO.
+#    O jq extrai o campo "token" da resposta { "token": "..." }.
 TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"usuario@fcg.com","senha":"Senha@12345"}' | jq -r '.token')
+  -d '{"email":"jogador@fcg.com","senha":"Senha@123"}' | jq -r '.token')
 
+# 3) Rota protegida SEM token -> 401
+curl -s -o /dev/null -w "sem-token=%{http_code}\n" http://localhost:8000/api/jogos
+
+# 4) Rota protegida COM token -> 200
 curl -s -o /dev/null -w "com-token=%{http_code}\n" http://localhost:8000/api/jogos \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Esperado: `sem-token=401` e `com-token=200`. O login (`POST /api/auth/login`, rota anônima) responde `{ "token": "..." }`.
+Esperado: `cadastro=201`, `sem-token=401`, `com-token=200`. Sem `jq` instalado, remova o pipe e copie o campo `token` da resposta do login para a chamada do passo 4.
+
+Em ambas as variantes, se o `login` falhar, o passo 4 recebe `401` — reautentique (passo 2) em vez de reaproveitar um token de outra sessão.
 
 ### Depurar (port-forward)
 
@@ -213,6 +294,11 @@ Plugin `jwt` aplicado por rota, validado **no próprio gateway**:
 - requisição sem token ou com token inválido/expirado recebe **`401` do próprio Kong**, sem chegar à API. Regras de negócio e de perfil (ex.: papéis exigidos por um endpoint) continuam valendo dentro de cada API.
 
 Os upstreams são internos: `users-api` e `catalog-api` são `ClusterIP` na porta `80` (`targetPort 8080`), alcançáveis apenas de dentro do cluster. Não existe mais `NodePort`: `http://localhost:30001` não responde.
+
+Contratos das rotas anônimas (as únicas que dispensam token):
+
+- `POST /api/usuarios` (cadastro) — corpo `{"nome": "...", "email": "...", "senha": "..."}` (`CriarUsuarioDTO`); a senha precisa ter no mínimo 8 caracteres, com ao menos uma letra, um dígito e um caractere especial; responde `201` no sucesso e `400` se o e-mail já existir ou o payload for inválido. Exemplo executável em [Acessar as APIs](#acessar-as-apis).
+- `POST /api/auth/login` — corpo `{"email": "...", "senha": "..."}` (`LoginDTO`); responde `200` com `{ "token": "..." }` ou `401` se as credenciais forem inválidas.
 
 ### Aviso: não definir porta HTTPS nos serviços
 
