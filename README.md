@@ -60,12 +60,16 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 | Kong (gateway) | `http://localhost:8000` | Único ponto de entrada das APIs (Kubernetes; ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)) |
 | RabbitMQ Management | `http://localhost:15672` (guest/guest) | Infraestrutura de desenvolvimento |
 | SQL Server | `localhost:1433` (sa/FCG@Password123) | Infraestrutura de desenvolvimento |
+| MongoDB | `ClusterIP:27017` | Avaliações dos jogos (Kubernetes): **não** é publicado pelo gateway; o acesso é por `kubectl port-forward svc/mongo 27017:27017` — ver [Persistência poliglota e cache](#persistência-poliglota-e-cache) |
+| Redis | `ClusterIP:6379` | Cache de leitura do catálogo (Kubernetes): **não** é publicado pelo gateway; o acesso é por `kubectl port-forward svc/redis 6379:6379` — ver [Persistência poliglota e cache](#persistência-poliglota-e-cache) |
 | Prometheus | `ClusterIP:9090` → `http://localhost:19090` | Observabilidade (Kubernetes): **não** é publicado pelo gateway; o acesso é por `port-forward` — ver [Observabilidade](#observabilidade) |
 | Grafana | `ClusterIP:3000` → `http://localhost:13000` | Observabilidade (Kubernetes): **não** é publicado pelo gateway; login `admin` e senha vêm do `Secret grafana-admin` |
 
 > As portas `5001`–`5004` das APIs não existem mais: os containers das APIs não publicam porta alguma no host.
 
 > Prometheus e Grafana também ficam **fechados dentro do cluster**: o gateway Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), e os dois Services são `ClusterIP` sem `EXTERNAL-IP` — chega-se a eles só por `port-forward`, nas portas locais `19090` e `13000` (ver [Observabilidade](#observabilidade)).
+
+> O mesmo vale para o **MongoDB e o Redis**: os dois são `ClusterIP` sem `EXTERNAL-IP` e **não** têm rota no Kong — quem fala com eles é o `catalog-api`, por `mongo:27017` e `redis:6379`, de dentro do cluster. Para inspecionar de fora, o caminho é `port-forward` (ver [Persistência poliglota e cache](#persistência-poliglota-e-cache)).
 
 ### Parar a aplicação
 
@@ -470,6 +474,101 @@ kubectl apply -f k8s/grafana-configmap.yaml              # só passa a valer no 
 kubectl rollout restart deployment/grafana
 ```
 
+## Persistência poliglota e cache
+
+Esta fase acrescenta dois serviços de dados ao cluster — **MongoDB** para as avaliações dos jogos e **Redis** para o cache de leitura do catálogo — cada um escolhido pelo **formato do dado**, não por substituição: o SQL Server continua sendo a fonte de verdade do catálogo e dos usuários, e nada foi migrado para fora dele. Os dois manifestos (`k8s/mongo-deployment.yaml` e `k8s/redis-deployment.yaml`) ficam na raiz de `k8s/` e entram no mesmo `kubectl apply -f k8s/` do restante do ambiente; os dois Services são `ClusterIP` (`mongo:27017` e `redis:6379`) e não têm rota no gateway.
+
+| Componente | Imagem | Persistência | Observação |
+|---|---|---|---|
+| MongoDB | `mongo:8.0.30` | PVC `mongo-data` (1Gi, `standard`) | `strategy: Recreate` de propósito: o PVC é `ReadWriteOnce` e, em rolling update, o pod novo ficaria preso esperando o volume — a mesma razão do Prometheus |
+| Redis | `redis:7.4.11-alpine3.21` | **nenhuma** (é cache) | Sem PVC por decisão: perder o conteúdo é aceitável porque a fonte de verdade é o SQL. `--maxmemory 128mb --maxmemory-policy allkeys-lru` |
+
+### Por que MongoDB (avaliações)
+
+- **É dado gerado pelo usuário, com formato que varia.** A `nota` (1 a 5) é obrigatória, mas o `comentario` é opcional e `tags[]` é uma lista livre — em modelo relacional isso vira coluna anulável mais uma tabela de tags, com junção a cada leitura, sem nenhum ganho de integridade em troca.
+- **A volumetria cresce com o uso, não com o cadastro.** Cada usuário pode avaliar cada jogo, e o conjunto cresce para sempre; é o oposto do **catálogo**, que é pequeno, tem preço e participa de junções com a biblioteca — e por isso continua no SQL Server.
+- **A leitura que importa é agregada.** O resumo (total e média) é uma agregação do próprio Mongo, não um `SELECT` que traz os documentos para a API calcular.
+- **Driver oficial `MongoDB.Driver` 3.11.2.** Database `fcg_catalog`, coleção `avaliacoes`, com **índice único `(gameId, userId)` criado no boot da API** — é ele que sustenta a regra "uma avaliação por usuário por jogo".
+- **A avaliação nunca é órfã:** o jogo precisa existir no SQL Server antes do `PUT`, senão a resposta é `404`.
+- **O catálogo não depende dele.** O Mongo serve **apenas** os endpoints de avaliação: com o Mongo fora, a listagem e a biblioteca continuam vindo do SQL Server (e do cache) e só as rotas `/avaliacoes` deixam de responder. Conferido em runtime com o Deployment em `0` réplicas: o `catalog-api` **sobe** assim mesmo e responde `/health` e `/metrics` com `200` — o `MongoDB.Driver` loga o timeout ao tentar criar o índice e o processo segue; o boot paga cerca de **30s** a mais por causa desse timeout.
+
+### Por que Redis (cache do catálogo)
+
+- **A listagem inteira vai ao SQL a cada chamada.** `GET /api/jogos` não tem paginação: devolve o catálogo completo todas as vezes, e é a consulta mais repetida da plataforma — o lugar onde o cache rende mais e arrisca menos.
+- **É cache, não banco.** O Redis não guarda nada que não possa ser reconstruído do SQL, e por isso não tem PVC: um restart do pod é irrelevante para a plataforma.
+- **A conexão não é segredo:** `Redis__ConnectionString: redis:6379` está no ConfigMap `catalog-api-config`.
+- **Degradação graciosa por desenho:** o cache é sempre opcional na leitura — se ele falhar, a resposta vem do SQL (detalhes em [Cache em operação](#cache-em-operação)).
+
+### Endpoints de avaliação
+
+As rotas passam pelo Kong como as demais (`/api/jogos`, JWT obrigatório) — **não** há rota nova no gateway, só endpoints novos no `catalog-api`:
+
+| Método e rota | Resposta |
+|---|---|
+| `PUT /api/jogos/{gameId}/avaliacoes` (o mesmo caminho também aceita `POST`) | `201` na primeira avaliação do usuário para aquele jogo e `200` ao atualizar (upsert por `(gameId, userId)`) |
+| `GET /api/jogos/{gameId}/avaliacoes` | Lista das avaliações do jogo, mais recentes primeiro (por `dataAtualizacao`) |
+| `GET /api/jogos/{gameId}/avaliacoes/resumo` | `{ "jogoId": "...", "total": 2, "notaMedia": 3.5 }` — com nenhuma avaliação, `total: 0` e `notaMedia` nulo |
+
+- Corpo de ambos (`PUT` e `POST`): `{"nota": 5, "comentario": "opcional", "tags": ["acao"]}`; `nota` entre **1 e 5** (`400` fora da faixa ou com corpo inválido).
+- **O caminho aceita `POST` além de `PUT`:** a spec da disciplina escreve `POST /api/jogos/{gameId}/avaliacoes`, então os dois verbos chegam ao mesmo action — o `PUT` é a forma preferida por ser um upsert idempotente, e as duas respondem os **mesmos status** (`201` na criação, `200` na atualização) e recebem o **mesmo JSON**.
+- **O autor vem do claim `Id` do token, nunca do corpo:** um `usuarioId` enviado no JSON é ignorado (comportamento conferido em runtime), e um token válido que **não** traga o claim `Id` recebe `401`.
+- Demais contratos: `404` se o jogo não existir no SQL Server, `401` sem token.
+
+### Cache em operação
+
+- **Onde ele mora:** um decorator `CachedGameRepository` sobre `IGameRepository` (`Microsoft.Extensions.Caching.StackExchangeRedis` 8.0.31) — o `GameService` não mudou, porque cache-aside é detalhe de acesso a dado, não regra de negócio.
+- **Chaves e TTL:** `catalog:games:all` (listagem) e `catalog:game:{id}` (por id), com **TTL de 60s** (`AbsoluteExpirationRelativeToNow`). Numa leitura real logo após o `GET`, o `TTL` da chave mediu **59**.
+- **Invalidação explícita no POST e no DELETE de jogo:** os dois passam por `Salvar()`, que remove `catalog:games:all` **e** `catalog:game:{id}` do jogo alterado. Sem isso, a listagem ficaria até 60s mentindo para quem lê logo depois de criar ou remover um jogo.
+- **Contadores `cache_hit` e `cache_miss`** no `/metrics`, coletados pelo Prometheus do SP2 (mesmo job `fcg-apis`). Atenção ao nome: o `prometheus-net` 8.2.1 expõe a série **exatamente como registrada, sem o sufixo `_total`** — no `/metrics` a linha é `cache_hit` seguida do valor, e **não** `cache_hit_total` (conferido em runtime; qualquer painel ou consulta tem de usar o nome cru).
+- **Frio x quente:** a primeira leitura vai ao SQL e a segunda vem do Redis, com o **corpo da resposta idêntico** nos dois casos (comparado em runtime, primeiro com o cache frio e depois quente). Numa medição real desta máquina: **32ms** no miss e **19ms** no hit.
+- **Degradação graciosa:** toda falha de cache é capturada e a leitura segue para o SQL — o Redis **não** derruba a API. Com o Redis fora do ar (`kubectl scale deployment/redis --replicas=0`), `GET /api/jogos`, `GET /api/jogos/{id}` e o `PUT` de avaliação continuam respondendo `200`, e o log traz `Falha ao ler a chave catalog:... do Redis; seguindo para o SQL Server.` na leitura e `Falha ao gravar a chave catalog:... no Redis; a resposta segue sem cache.` na gravação. O preço são os timeouts do cliente (2s por operação): a listagem medida nesse cenário levou **5,6s** antes de responder. Com o Redis de volta, as chaves são recriadas e o `cache_hit` volta a subir — não é preciso reiniciar o `catalog-api`.
+- **Inspecionar as chaves (armadilha):** o `IDistributedCache` grava o valor como **hash** (`HSET <chave> data/absexp/sldexp`), então `redis-cli GET <chave>` devolve **`WRONGTYPE`** (a chave existe e é um hash; numa chave inexistente a saída é vazia). O erro não é do cache — confira com `EXISTS`/`TYPE`/`HLEN`:
+
+```bash
+kubectl exec deploy/redis -- redis-cli exists catalog:games:all   # 1
+kubectl exec deploy/redis -- redis-cli type catalog:games:all     # hash
+kubectl exec deploy/redis -- redis-cli hlen catalog:games:all     # 3 (data, absexp, sldexp)
+kubectl exec deploy/redis -- redis-cli ttl catalog:games:all      # ate 60
+kubectl exec deploy/redis -- redis-cli keys 'catalog:*'
+```
+
+### Subir o Mongo e o Redis
+
+O `Secret mongo-secret` é **pré-requisito do apply**, como o `grafana-admin`: o Deployment do Mongo o referencia em `secretKeyRef` e, sem ele, o pod fica em `CreateContainerConfigError`. Ele é criado à mão e **nunca vai para o git**:
+
+```powershell
+# 1) Secret do Mongo — crie ANTES do apply (usuario e senha sao seus; nao vao para o git):
+kubectl create secret generic mongo-secret `
+  --from-literal=root-username='<usuario>' `
+  --from-literal=root-password='<senha>' `
+  --from-literal=connection-string='mongodb://<usuario>:<senha>@mongo:27017/?authSource=admin' `
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2) O Mongo e o Redis estao na raiz de k8s/, entao entram no mesmo apply
+#    da infraestrutura, das APIs e da observabilidade (ver "Aplicar os manifestos"):
+kubectl apply -f k8s/
+```
+
+> A senha do Mongo deve ser **alfanumérica**: em URI, caractere especial precisa vir percent-encoded (`@` → `%40`) e é uma fonte clássica de erro silencioso de conexão. A chave `connection-string` do segredo é o que o `catalog-api` consome em `Mongo__ConnectionString`; o database vem do ConfigMap, em `Mongo__DatabaseName` (`fcg_catalog`).
+
+Confira o que subiu (o Mongo é o único dos dois que tem PVC):
+
+```bash
+kubectl get pods -l 'app in (mongo,redis)'
+kubectl get pvc mongo-data
+kubectl get svc mongo redis
+```
+
+Esperado: os dois pods `Running` e `Ready` (`1/1`), o PVC `mongo-data` em `Bound` e os dois Services como `ClusterIP`. O Redis **não** tem PVC nenhum de propósito — não estranhe a ausência dele.
+
+### Limitações conhecidas e follow-ups
+
+- **O `docker-compose.yml` não sobe Mongo nem Redis.** O caminho do Compose continua sendo apenas a infraestrutura de desenvolvimento (RabbitMQ e SQL Server) e as APIs; esta fase é contemplada **somente** pelo fluxo do cluster, documentado acima.
+- **Não há circuit breaker no cache.** Com o Redis fora, cada leitura cacheada paga os timeouts de conexão (2s por operação; 5,6s na listagem medida) antes de cair no SQL — a API responde certo, mas mais devagar enquanto o Redis estiver indisponível.
+- **O cache é do `catalog-api`.** A `users-api` não lê nem invalida chave alguma: `GET /api/usuarios` continua indo ao SQL a cada chamada.
+- **O `ErrorHandlingMiddleware` do `catalog-api` vaza stack trace e responde em PascalCase.** Ele devolve `Detalhe` com o **stack trace** da exceção e serializa o corpo como `StatusCode`/`Mensagem`/`Detalhe`, enquanto os controllers existentes respondem `{"mensagem": ...}` em camelCase. O defeito **já foi observado em runtime** no `401` de um token válido sem o claim `Id`, cuja resposta trouxe o stack trace com `AvaliacoesController.ObterUsuarioId()`.
+- **O scrape do Prometheus é estático por Service** (`users-api:80`, `catalog-api:80`), o que **pressupõe 1 réplica por API**: com 2+ réplicas ele raspa um pod aleatório por scrape e as réplicas colapsam numa única série — revisar ao escalar.
+
 ## Estrutura de arquivos
 
 ```
@@ -478,6 +577,8 @@ fcg-orchestration/
 ├── k8s/
 │   ├── rabbitmq-deployment.yaml
 │   ├── sqlserver-deployment.yaml
+│   ├── mongo-deployment.yaml
+│   ├── redis-deployment.yaml
 │   ├── users-api-configmap.yaml
 │   ├── users-api-secret.yaml
 │   ├── users-api-deployment.yaml
