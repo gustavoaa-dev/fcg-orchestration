@@ -158,6 +158,13 @@ kubectl get svc users-api catalog-api kong
 
 Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`.
 
+Se o pod do Kong **não** sair de `ContainerCreating`/`Pending`, o caso mais comum é a imagem não resolver: com uma tag inexistente (a tag documentada aqui é `kong:3.9`) o pod fica em **`ImagePullBackOff`** e o Service fica **sem endpoints** — daí todos os `curl` ao gateway falharem. Diagnóstico rápido:
+
+```bash
+kubectl describe pod -l app=kong             # procure "Failed to pull image" na seção Events
+kubectl get events --field-selector reason=Failed
+```
+
 Confirme também que as APIs ficaram fechadas: `users-api` e `catalog-api` aparecem como `ClusterIP` e **não existe mais `NodePort`** (as antigas `30001`/`30002` não respondem).
 
 E confirme a exposição do gateway em `kubectl get svc kong`:
@@ -272,14 +279,14 @@ kubectl delete secret kong-declarative-config
 
 ## API Gateway (Kong)
 
-O [Kong 3.10](https://konghq.com/) em modo **DB-less** é o ponto de entrada único das APIs: `http://localhost:8000`. Nenhuma API é acessível diretamente de fora do cluster.
+O [Kong 3.9](https://konghq.com/) em modo **DB-less** é o ponto de entrada único das APIs: `http://localhost:8000`. Nenhuma API é acessível diretamente de fora do cluster.
 
 ### Como está montado
 
 | Componente | Onde vive | Papel |
 |---|---|---|
 | Config declarativa | `k8s/kong/kong.yml.template` | Serviços, rotas, plugin `jwt` e consumer — versionado, com o marcador `${JWT_SECRET}` no lugar do segredo |
-| Deployment + Service | `k8s/kong/kong-deployment.yaml` | Kong `3.10` com `KONG_DATABASE=off`, proxy em `0.0.0.0:8000`; Service `LoadBalancer` publicando **apenas** a porta `8000` |
+| Deployment + Service | `k8s/kong/kong-deployment.yaml` | Kong `3.9` com `KONG_DATABASE=off`, proxy em `0.0.0.0:8000`; Service `LoadBalancer` publicando **apenas** a porta `8000`; Admin API em loopback (`127.0.0.1:8001`) e Status API em `0.0.0.0:8100`, ambas fora do Service |
 | Config renderizada | `Secret kong-declarative-config` (cluster) | `kong.yml` final, montado somente leitura em `/kong/declarative/kong.yml` |
 | Script de deploy | `scripts/deploy-kong.ps1` | Renderiza o template, aplica o `Secret`, reinicia o Kong e espera o rollout |
 
