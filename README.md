@@ -13,7 +13,7 @@ A plataforma é composta por 4 microsserviços independentes que se comunicam de
 | PaymentsAPI | [fcg-payments-api](https://github.com/gustavoaa-dev/fcg-payments-api) | Processamento de pagamentos |
 | NotificationsAPI | [fcg-notifications-api](https://github.com/gustavoaa-dev/fcg-notifications-api) | Envio de notificações |
 
-Todo o acesso externo passa pelo **API Gateway (Kong)** em `http://localhost:8000`: as APIs **não** são publicadas diretamente. Detalhes em [API Gateway (Kong)](#api-gateway-kong).
+Todo o acesso externo passa pelo **API Gateway (Kong)** — em `http://localhost:8000` quando o `EXTERNAL-IP` do `svc/kong` for `localhost` ou com o `port-forward` ativo, e em `http://<EXTERNAL-IP>:8000` quando o cluster entregar um IP de rede (ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)): as APIs **não** são publicadas diretamente. Detalhes em [API Gateway (Kong)](#api-gateway-kong).
 
 ### Fluxo de eventos
 
@@ -53,7 +53,7 @@ docker-compose up -d
 
 ### Serviços e portas
 
-As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kong em `http://localhost:8000` (ver [API Gateway (Kong)](#api-gateway-kong)). No Compose sobem apenas a infraestrutura de desenvolvimento e os containers das APIs dentro da rede interna `fcg-network`; o gateway Kong faz parte do [deploy no Kubernetes](#como-fazer-deploy-no-kubernetes).
+As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kong — `http://localhost:8000` com o `EXTERNAL-IP` do `svc/kong` em `localhost` ou com o `port-forward` ativo (ver [exposição por cluster](#expor-o-gateway-porta-de-entrada) e [API Gateway (Kong)](#api-gateway-kong)). No Compose sobem apenas a infraestrutura de desenvolvimento e os containers das APIs dentro da rede interna `fcg-network`; o gateway Kong faz parte do [deploy no Kubernetes](#como-fazer-deploy-no-kubernetes).
 
 | Serviço | Porta | Observação |
 |---|---|---|
@@ -146,7 +146,7 @@ kubectl port-forward svc/kong 8000:8000
 
 Nos exemplos deste README, **`http://localhost:8000` vale quando o `port-forward` está ativo ou quando o `EXTERNAL-IP` do `svc/kong` é `localhost`**; nos demais casos, troque a base da URL pelo `EXTERNAL-IP` — os dois blocos de exemplo abaixo já trazem uma variável (`$gateway` / `$GATEWAY`) só para isso.
 
-Como o Kong publica apenas a porta `8000`, o `port-forward` do proxy não conflita com nenhum outro: a Admin API (`8001`) e a Status API (`8100`) **não são publicadas no Service** (ver [Depurar (port-forward)](#depurar-port-forward)).
+Como o Kong publica apenas a porta `8000`, o `port-forward` do proxy não conflita com nenhum outro: a Admin API (`8001`) e a Status API (`8100`) **não são publicadas no Service** e só são alcançáveis por `port-forward` — cada um sobe numa porta local distinta (`8000`, `8001`, `8100`), então os três podem ficar ativos ao mesmo tempo (ver [Depurar (port-forward)](#depurar-port-forward)).
 
 ### Verificar o deploy
 
@@ -260,13 +260,22 @@ O gateway é a única entrada suportada; os comandos abaixo servem **apenas para
 kubectl port-forward svc/users-api 8080:80
 
 # Admin API do Kong — NÃO é publicada no Service e escuta apenas em 127.0.0.1 dentro
-# do pod, então o acesso é por dentro dele (nem `kubectl port-forward` alcança o loopback):
-kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status
-# para ver as rotas carregadas da config declarativa:
-kubectl exec -it deploy/kong -- curl -s http://localhost:8001/routes
+# do pod. O port-forward alcança esse loopback (ele abre o túnel dentro do netns do pod),
+# então continue usando o mesmo comando de sempre:
+kubectl port-forward deploy/kong 8001:8001
+# com o forward ativo, em OUTRO terminal:
+curl -s http://localhost:8001/status     # 200
+curl -s http://localhost:8001/routes     # users-login, catalog-jogos, catalog-biblioteca, users-protegida, users-signup
+
+# Alternativa sem curl (nem no host nem no pod) — o próprio binário do Kong:
+kubectl exec -it deploy/kong -- kong health
+# e para validar o parse da config declarativa montada no pod:
+kubectl exec -it deploy/kong -- kong config parse /kong/declarative/kong.yml
 ```
 
-> A Admin API é consultada **por dentro do pod** de propósito: em DB-less o `GET /` devolve a configuração declarativa inteira, incluindo o `secret` HMAC do consumer — mantê-la só no loopback evita que qualquer pod do cluster leia a chave e forje tokens.
+> A Admin API continua restrita ao loopback do pod de propósito: em DB-less o `GET /` devolve a configuração declarativa inteira, incluindo o `secret` HMAC do consumer — mantê-la fora da rede do cluster (e fora do Service) evita que qualquer pod leia a chave e forje tokens. O `port-forward` é um túnel da **sua** máquina para o loopback do pod, não uma exposição da porta: por isso ele funciona e a Admin API segue inalcançável de qualquer outro pod.
+>
+> A imagem `kong:3.9` **não traz `curl`** (só o binário `kong`), então `kubectl exec -it deploy/kong -- curl ...` não funciona — use o par `port-forward` + `curl` no host, ou os comandos `kong health` / `kong config parse` dentro do pod.
 
 ### Remover o deploy
 
@@ -279,7 +288,7 @@ kubectl delete secret kong-declarative-config
 
 ## API Gateway (Kong)
 
-O [Kong 3.9](https://konghq.com/) em modo **DB-less** é o ponto de entrada único das APIs: `http://localhost:8000`. Nenhuma API é acessível diretamente de fora do cluster.
+O [Kong 3.9](https://konghq.com/) em modo **DB-less** é o ponto de entrada único das APIs: `http://localhost:8000` quando o `EXTERNAL-IP` do `svc/kong` for `localhost` ou com o `port-forward` ativo, e `http://<EXTERNAL-IP>:8000` quando o cluster entregar um IP de rede (ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)). Nenhuma API é acessível diretamente de fora do cluster.
 
 ### Como está montado
 
@@ -290,7 +299,7 @@ O [Kong 3.9](https://konghq.com/) em modo **DB-less** é o ponto de entrada úni
 | Config renderizada | `Secret kong-declarative-config` (cluster) | `kong.yml` final, montado somente leitura em `/kong/declarative/kong.yml` |
 | Script de deploy | `scripts/deploy-kong.ps1` | Renderiza o template, aplica o `Secret`, reinicia o Kong e espera o rollout |
 
-A Admin API (`8001`) **não é publicada no Service** e escuta apenas em `127.0.0.1` **dentro do pod** — o acesso é por `kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status` (ver [Depurar (port-forward)](#depurar-port-forward)). As probes usam a Status API (`8100`), que também não é publicada.
+A Admin API (`8001`) **não é publicada no Service** e escuta apenas em `127.0.0.1` **dentro do pod**; o acesso é por `kubectl port-forward deploy/kong 8001:8001` + `curl http://localhost:8001/status` (o `port-forward` alcança o loopback do pod — ver [Depurar (port-forward)](#depurar-port-forward)). Dentro do pod, sem `curl` (a imagem `kong:3.9` não o traz), use `kubectl exec -it deploy/kong -- kong health`. As probes usam a Status API (`8100`), que também não é publicada.
 
 ### Como o segredo JWT é injetado
 
@@ -340,13 +349,20 @@ Portanto: **não defina porta HTTPS nos Deployments/ConfigMaps das APIs, nem pub
 ### Depurar o gateway
 
 ```bash
-# Admin API do Kong — só existe em 127.0.0.1 dentro do pod (não é publicada no Service
-# nem alcançável por port-forward, que fala com o IP do pod e não com o loopback):
-kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status
-kubectl exec -it deploy/kong -- curl -s http://localhost:8001/routes   # /services | /plugins | /consumers
+# Admin API do Kong — escuta só no loopback do pod e não é publicada no Service;
+# o port-forward alcança o loopback (túnel aberto dentro do netns do pod):
+kubectl port-forward deploy/kong 8001:8001
+# com o forward ativo, em outro terminal:
+curl -s http://localhost:8001/status
+curl -s http://localhost:8001/routes     # /services | /plugins | /consumers
 
-# Status API (8100) — a mesma que as probes usam; também não é publicada
-kubectl exec -it deploy/kong -- curl -s http://localhost:8100/status/ready
+# Sem curl (a imagem kong:3.9 não traz curl): health do Kong e parse da config montada
+kubectl exec -it deploy/kong -- kong health
+kubectl exec -it deploy/kong -- kong config parse /kong/declarative/kong.yml
+
+# Status API (8100) — a mesma que as probes usam; também não é publicada no Service
+kubectl port-forward deploy/kong 8100:8100
+curl -s http://localhost:8100/status/ready
 
 # Logs do Kong (mostram o 401/200 de cada requisição)
 kubectl logs deploy/kong -f
