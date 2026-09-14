@@ -95,7 +95,7 @@ docker build -t fcg-payments-api:latest .
 docker build -t fcg-notifications-api:latest .
 ```
 
-> **Convenção de tag: cada rebuild exige uma tag nova.** As APIs instrumentadas nesta fase usam tag **versionada por fase** — as duas revisões do SP2 são buildadas como `fcg-users-api:sp2` e `fcg-catalog-api:sp2`, e é exatamente essa tag que está declarada em `k8s/users-api-deployment.yaml` e `k8s/catalog-api-deployment.yaml` (`payments-api` e `notifications-api` ainda usam `:latest`). Com `imagePullPolicy: IfNotPresent` **rebuildar a mesma tag não atualiza o pod**: o kubelet encontra a imagem daquela tag já presente no nó e reutiliza a antiga, sem novo pull — o `kubectl rollout restart` sobe de novo, mas com o binário velho. Publicar alteração de código é, portanto, sempre um passo de três partes: **buildar com tag nova** (`:sp3`), **trocar a tag no manifesto** e **reaplicar** — `docker build -t fcg-users-api:sp3 .`, editar `image:` em `k8s/users-api-deployment.yaml` e `kubectl apply -f k8s/users-api-deployment.yaml`. (É por isso que os comandos acima não usam `-t fcg-users-api .`, que gera a tag móvel `:latest`: ela não distingue duas revisões e o pod passa a rodar código diferente do que o git descreve.)
+> **Convenção de tag: cada rebuild exige uma tag nova.** As APIs instrumentadas nesta fase usam tag **versionada por fase** — as duas APIs revisadas no SP2 (`users-api` e `catalog-api`) são buildadas como `fcg-users-api:sp2` e `fcg-catalog-api:sp2`, e é exatamente essa tag que está declarada em `k8s/users-api-deployment.yaml` e `k8s/catalog-api-deployment.yaml` (`payments-api` e `notifications-api` ainda usam `:latest`). Com `imagePullPolicy: IfNotPresent` **rebuildar a mesma tag não atualiza o pod**: o kubelet encontra a imagem daquela tag já presente no nó e reutiliza a antiga, sem novo pull — o `kubectl rollout restart` sobe de novo, mas com o binário velho. Publicar alteração de código é, portanto, sempre um passo de três partes: **buildar com tag nova** (`:sp3`), **trocar a tag no manifesto** e **reaplicar** — `docker build -t fcg-users-api:sp3 .`, editar `image:` em `k8s/users-api-deployment.yaml` e `kubectl apply -f k8s/users-api-deployment.yaml`. Se você alterar `payments-api` ou `notifications-api`, a mesma regra vale — tag nova por rebuild (hoje elas ainda estão em `:latest`, e é justamente por isso que um rebuild delas não chega ao pod). (É por isso que os comandos acima não usam `-t fcg-users-api .`, que gera a tag móvel `:latest`: ela não distingue duas revisões e o pod passa a rodar código diferente do que o git descreve.)
 
 ### Aplicar os manifestos
 
@@ -167,7 +167,7 @@ kubectl get svc users-api catalog-api kong prometheus grafana
 kubectl get pvc prometheus-data
 ```
 
-Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`, e os do Prometheus e do Grafana só sobem depois do `Secret grafana-admin` (ver [Observabilidade](#observabilidade)).
+Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`, e o **do Grafana** só sobe depois do `Secret grafana-admin` (ele é o único que referencia o Secret; se o pod do **Prometheus** não subir, a causa é outra — PVC/StorageClass ou imagem — ver [Observabilidade](#observabilidade)).
 
 Se o pod do Kong **não** sair de `ContainerCreating`/`Pending`, o caso mais comum é a imagem não resolver: com uma tag inexistente (a tag documentada aqui é `kong:3.9`) o pod fica em **`ImagePullBackOff`** e o Service fica **sem endpoints** — daí todos os `curl` ao gateway falharem. Diagnóstico rápido:
 
@@ -392,6 +392,7 @@ A stack escolhida para esta fase é a **Opção A — Prometheus + Grafana**: as
 - **Visualização:** o Grafana sobe com datasource e dashboard **provisionados por ConfigMap** (`k8s/grafana-configmap.yaml` e `k8s/grafana-dashboards-configmap.yaml`) — nada é cadastrado à mão na interface. O datasource `Prometheus` (`uid: prometheus`) aponta para `http://prometheus:9090`, e o dashboard **FCG - APIs** (`uid: fcg-apis`) traz latência (p50/p95), requisições por segundo, requisições por status code e taxa de erro 5xx — todos derivados de `http_request_duration_seconds_bucket` e `http_requests_received_total`, coletados na porta `/metrics` das APIs.
 - **Exposição:** nenhum dos dois é publicado pelo gateway — ambos são `ClusterIP` e o acesso é por `port-forward` (veja abaixo). O Kong só roteia `/api/*`, então `/metrics` e `/health` não saem do cluster (o mesmo vale para a interface do Prometheus e a do Grafana). O aviso de [não definir porta HTTPS nos serviços](#aviso-não-definir-porta-https-nos-serviços) continua valendo para os dois.
 - **Senha do Grafana:** o login é `admin` e a senha vem do `Secret` `grafana-admin` (chave `admin-password`) — que **nunca** vai para o git. As demais configurações do Grafana são fixas no manifesto, entre elas `GF_USERS_ALLOW_SIGN_UP=false`.
+- **Persistência do Grafana:** o container monta `emptyDir` em `/var/lib/grafana`, então nada daí sobrevive a um restart do pod. Isso não afeta datasource nem dashboard — os dois são **recriados pela provisão a cada start** (é o que a montagem por ConfigMap garante) —, mas dados criados pela UI (usuários extras, snapshots, preferências) **são perdidos**: trate os manifestos de provisionamento como a fonte de verdade e não conte com a interface para o que precisa durar.
 
 ### Subir a stack
 
@@ -416,9 +417,9 @@ kubectl get svc prometheus grafana
 
 Esperado: os dois pods `Running` e `Ready` (`1/1`), o PVC em `Bound` e os dois Services como `ClusterIP`.
 
-> Logo depois do apply é normal o `prometheus-data` aparecer como **`Pending`**: com `WaitForFirstConsumer` a StorageClass só provisiona o volume quando o pod que o consome é criado. Assim que o pod do Prometheus entra em execução o PVC passa a `Bound` — só investigue se ele continuar `Pending` com o pod agendado.
+> Logo depois do apply é normal o `prometheus-data` aparecer como **`Pending`**: com `WaitForFirstConsumer` a StorageClass só provisiona o volume quando o pod que o consome é criado. Assim que o pod do Prometheus entra em execução o PVC passa a `Bound` — só investigue se ele continuar `Pending` com o pod agendado. (Confirmado neste cluster: a `standard` usa `WaitForFirstConsumer`, e o evento do PVC é literalmente `WaitForFirstConsumer: waiting for first consumer to be created before binding`.)
 
-> O Deployment do Prometheus usa `strategy: Recreate` de propósito: o PVC é `ReadWriteOnce` (um pod monta o volume por vez), então um rolling update que tentasse subir o segundo pod deixaria o Service sem endpoints.
+> O Deployment do Prometheus usa `strategy: Recreate` de propósito: o PVC é `ReadWriteOnce`, então o pod novo não conseguiria montar o volume enquanto o antigo o estivesse usando (ou, num provisioner local onde o `ReadWriteOnce` não é imposto, montaria o mesmo caminho por cima do primeiro, com risco para o TSDB). O rollout ficaria **preso** esperando o novo pod ficar `Ready` — e, como no rolling update o pod antigo não é removido antes disso, a troca nunca terminaria.
 
 ### Acessar os painéis (port-forward)
 
@@ -438,6 +439,8 @@ curl -s "http://localhost:19090/api/v1/targets?state=active"
 # série de fato coletada — é o nome de métrica usado pelos painéis
 curl -s "http://localhost:19090/api/v1/query?query=http_requests_received_total"
 ```
+
+> No **PowerShell**, `curl` resolve para o alias de `Invoke-WebRequest` e esses comandos falham — use `curl.exe -s` (o `curl.exe` do Windows 10/11 é o `curl` de verdade). O mesmo cuidado vale para os exemplos de `curl` deste README.
 
 ### Gerar tráfego para os painéis
 
