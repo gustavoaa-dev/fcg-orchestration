@@ -60,8 +60,12 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 | Kong (gateway) | `http://localhost:8000` | Único ponto de entrada das APIs (Kubernetes; ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)) |
 | RabbitMQ Management | `http://localhost:15672` (guest/guest) | Infraestrutura de desenvolvimento |
 | SQL Server | `localhost:1433` (sa/FCG@Password123) | Infraestrutura de desenvolvimento |
+| Prometheus | `ClusterIP:9090` → `http://localhost:19090` | Observabilidade (Kubernetes): **não** é publicado pelo gateway; o acesso é por `port-forward` — ver [Observabilidade](#observabilidade) |
+| Grafana | `ClusterIP:3000` → `http://localhost:13000` | Observabilidade (Kubernetes): **não** é publicado pelo gateway; login `admin` e senha vêm do `Secret grafana-admin` |
 
 > As portas `5001`–`5004` das APIs não existem mais: os containers das APIs não publicam porta alguma no host.
+
+> Prometheus e Grafana também ficam **fechados dentro do cluster**: o gateway Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), e os dois Services são `ClusterIP` sem `EXTERNAL-IP` — chega-se a eles só por `port-forward`, nas portas locais `19090` e `13000` (ver [Observabilidade](#observabilidade)).
 
 ### Parar a aplicação
 
@@ -81,20 +85,24 @@ docker-compose down
 
 ### Build das imagens
 
+As imagens são buildadas **localmente** (não há registry) e o cluster as consome com `imagePullPolicy: IfNotPresent`. A tag usada no build tem de ser **a mesma** declarada no manifesto:
+
 ```bash
 # Em cada diretório de microsserviço:
-docker build -t fcg-users-api .
-docker build -t fcg-catalog-api .
-docker build -t fcg-payments-api .
-docker build -t fcg-notifications-api .
+docker build -t fcg-users-api:sp2 .
+docker build -t fcg-catalog-api:sp2 .
+docker build -t fcg-payments-api:latest .
+docker build -t fcg-notifications-api:latest .
 ```
+
+> **Convenção de tag: cada rebuild exige uma tag nova.** As APIs instrumentadas nesta fase usam tag **versionada por fase** — as duas APIs revisadas no SP2 (`users-api` e `catalog-api`) são buildadas como `fcg-users-api:sp2` e `fcg-catalog-api:sp2`, e é exatamente essa tag que está declarada em `k8s/users-api-deployment.yaml` e `k8s/catalog-api-deployment.yaml` (`payments-api` e `notifications-api` ainda usam `:latest`). Com `imagePullPolicy: IfNotPresent` **rebuildar a mesma tag não atualiza o pod**: o kubelet encontra a imagem daquela tag já presente no nó e reutiliza a antiga, sem novo pull — o `kubectl rollout restart` sobe de novo, mas com o binário velho. Publicar alteração de código é, portanto, sempre um passo de três partes: **buildar com tag nova** (`:sp3`), **trocar a tag no manifesto** e **reaplicar** — `docker build -t fcg-users-api:sp3 .`, editar `image:` em `k8s/users-api-deployment.yaml` e `kubectl apply -f k8s/users-api-deployment.yaml`. Se você alterar `payments-api` ou `notifications-api`, a mesma regra vale — tag nova por rebuild (hoje elas ainda estão em `:latest`, e é justamente por isso que um rebuild delas não chega ao pod). (É por isso que os comandos acima não usam `-t fcg-users-api .`, que gera a tag móvel `:latest`: ela não distingue duas revisões e o pod passa a rodar código diferente do que o git descreve.)
 
 ### Aplicar os manifestos
 
-A **ordem importa**: primeiro a infraestrutura e as APIs, depois o gateway Kong.
+A **ordem importa**: primeiro a infraestrutura, as APIs e a observabilidade (com o `Secret` do Grafana antes do apply), depois o gateway Kong.
 
 ```bash
-# 1) Infraestrutura (RabbitMQ, SQL Server) e APIs
+# 1) Infraestrutura (RabbitMQ, SQL Server), APIs e observabilidade (Prometheus, Grafana)
 kubectl apply -f k8s/
 
 # 2) Gateway Kong — depende do Secret users-api-secret, criado no passo 1
@@ -102,6 +110,8 @@ kubectl apply -f k8s/kong/kong-deployment.yaml
 ```
 
 > `kubectl apply -f k8s/` não é recursivo: aplica apenas os manifestos que estão na raiz de `k8s/`. O subdiretório `k8s/kong/` é aplicado em separado de propósito, porque o pod do Kong só fica pronto depois de o script abaixo criar o `Secret kong-declarative-config`.
+
+> Antes desse apply crie o `Secret grafana-admin`: o Deployment do Grafana o referencia em `secretKeyRef` e, sem ele, o pod fica em `CreateContainerConfigError` (comando em [Subir a stack](#subir-a-stack)).
 
 ### Configurar o gateway (segredo JWT)
 
@@ -153,10 +163,11 @@ Como o Kong publica apenas a porta `8000`, o `port-forward` do proxy não confli
 ```bash
 kubectl get pods
 kubectl get services
-kubectl get svc users-api catalog-api kong
+kubectl get svc users-api catalog-api kong prometheus grafana
+kubectl get pvc prometheus-data
 ```
 
-Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`.
+Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`, e o **do Grafana** só sobe depois do `Secret grafana-admin` (ele é o único que referencia o Secret; se o pod do **Prometheus** não subir, a causa é outra — PVC/StorageClass ou imagem — ver [Observabilidade](#observabilidade)).
 
 Se o pod do Kong **não** sair de `ContainerCreating`/`Pending`, o caso mais comum é a imagem não resolver: com uma tag inexistente (a tag documentada aqui é `kong:3.9`) o pod fica em **`ImagePullBackOff`** e o Service fica **sem endpoints** — daí todos os `curl` ao gateway falharem. Diagnóstico rápido:
 
@@ -284,7 +295,11 @@ kubectl delete -f k8s/kong/kong-deployment.yaml
 kubectl delete -f k8s/
 # o Secret do Kong é criado pelo script, não pelos manifestos:
 kubectl delete secret kong-declarative-config
+# o Secret do Grafana também é criado à mão, não pelos manifestos:
+kubectl delete secret grafana-admin
 ```
+
+> `kubectl delete -f k8s/` também remove o PVC `prometheus-data`: o histórico coletado pelo Prometheus vai junto (a retenção de 7 dias é descartada).
 
 ## API Gateway (Kong)
 
@@ -368,6 +383,93 @@ curl -s http://localhost:8100/status/ready
 kubectl logs deploy/kong -f
 ```
 
+## Observabilidade
+
+A stack escolhida para esta fase é a **Opção A — Prometheus + Grafana**: as duas ferramentas são de **código aberto, sem custo e sem dependência de conta em nuvem**, então a plataforma continua executável apenas com o Docker Desktop, sem serviço externo, sem chave de API e sem enviar métrica alguma para fora da máquina. Toda a pilha é declarativa: a instrumentação é código nas APIs e o resto são manifestos Kubernetes versionados **neste repositório** (`k8s/prometheus-*.yaml` e `k8s/grafana-*.yaml`), aplicados pelo mesmo `kubectl apply -f k8s/` do restante do ambiente.
+
+- **Instrumentação:** `users-api` e `catalog-api` expõem `/metrics` (biblioteca `prometheus-net` 8.2.1) e `/health`. O `UseHttpMetrics()` está posicionado de forma que os `401`/`403` de `[Authorize]` e as exceções tratadas pelo `ErrorHandlingMiddleware` também entram nas métricas — confirmado nas séries, com `controller`, `action` e `endpoint` preenchidos (ex.: `http_requests_received_total{code="401",method="GET",controller="Users",action="ObterTodos",endpoint="api/usuarios"}`). As probes `startup`/`readiness`/`liveness` dos dois Deployments apontam para `/health:8080`.
+- **Coleta:** o Prometheus raspa `users-api:80` e `catalog-api:80` (job `fcg-apis`, `metrics_path: /metrics`) a cada **15s** (`k8s/prometheus-configmap.yaml`), além de a si mesmo em `localhost:9090`, e guarda **7 dias** de dados em volume persistente (`--storage.tsdb.retention.time=7d`, PVC `prometheus-data`, 2Gi).
+- **Visualização:** o Grafana sobe com datasource e dashboard **provisionados por ConfigMap** (`k8s/grafana-configmap.yaml` e `k8s/grafana-dashboards-configmap.yaml`) — nada é cadastrado à mão na interface. O datasource `Prometheus` (`uid: prometheus`) aponta para `http://prometheus:9090`, e o dashboard **FCG - APIs** (`uid: fcg-apis`) traz latência (p50/p95) por rota, requisições por segundo por rota, requisições por status code, taxa de erro 5xx e um painel de coleta (`up`) por alvo — os quatro painéis de tráfego derivam de `http_request_duration_seconds_bucket` e `http_requests_received_total`, coletados na porta `/metrics` das APIs, e o de coleta vem da série `up` do próprio Prometheus. Os quatro painéis de tráfego **excluem as probes `/health`** (filtro `endpoint!="/health"`): sozinhas elas respondem por quase todo o volume coletado (um `code="200"` a cada 5s/10s por pod) e afogariam o tráfego de negócio — o número que aparece nesses painéis é tráfego de negócio, não probe. As rotas aparecem pelo **RoutePattern** do ASP.NET, **sem a barra inicial** do path: `/api/jogos` é exibido como `api/jogos`, `/api/usuarios` como `api/usuarios`; a única série que mantém a barra é a própria probe, `endpoint="/health"` — é por isso que qualquer filtro por `endpoint` precisa casar com esses valores exatos.
+- **Exposição:** nenhum dos dois é publicado pelo gateway — ambos são `ClusterIP` e o acesso é por `port-forward` (veja abaixo). O Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), então `/metrics` e `/health` não saem do cluster (o mesmo vale para a interface do Prometheus e a do Grafana).
+- **Senha do Grafana:** o login é `admin` e a senha vem do `Secret` `grafana-admin` (chave `admin-password`) — que **nunca** vai para o git. As demais configurações do Grafana são fixas no manifesto, entre elas `GF_USERS_ALLOW_SIGN_UP=false`.
+- **Persistência do Grafana:** o container monta `emptyDir` em `/var/lib/grafana`, então nada daí sobrevive a um restart do pod. Isso não afeta datasource nem dashboard — os dois são **recriados pela provisão a cada start** (é o que a montagem por ConfigMap garante) —, mas dados criados pela UI (usuários extras, snapshots, preferências) **são perdidos**: trate os manifestos de provisionamento como a fonte de verdade e não conte com a interface para o que precisa durar.
+
+### Subir a stack
+
+A ordem importa: **o `Secret` do Grafana precisa existir antes do apply**, porque o Deployment o referencia em `secretKeyRef` — sem ele o pod fica em `CreateContainerConfigError`.
+
+```powershell
+# 1) Secret do Grafana — crie ANTES do apply (a senha é sua; não vai para o git):
+kubectl create secret generic grafana-admin --from-literal=admin-password='<sua-senha>' --dry-run=client -o yaml | kubectl apply -f -
+
+# 2) Prometheus e Grafana estão na raiz de k8s/, então entram no mesmo apply
+#    da infraestrutura e das APIs (ver "Aplicar os manifestos"):
+kubectl apply -f k8s/
+```
+
+O PVC `prometheus-data` declara `storageClassName: standard`, então a StorageClass `standard` (a default do Docker Desktop) é **pré-requisito**: num cluster sem ela o PVC fica `Pending` indefinidamente, porque não há provisionamento dinâmico. Confira o que subiu:
+
+```bash
+kubectl get pods -l 'app in (prometheus,grafana)'
+kubectl get pvc prometheus-data
+kubectl get svc prometheus grafana
+```
+
+Esperado: os dois pods `Running` e `Ready` (`1/1`), o PVC em `Bound` e os dois Services como `ClusterIP`.
+
+> Logo depois do apply é normal o `prometheus-data` aparecer como **`Pending`**: com `WaitForFirstConsumer` a StorageClass só provisiona o volume quando o pod que o consome é criado. Assim que o pod do Prometheus entra em execução o PVC passa a `Bound` — só investigue se ele continuar `Pending` com o pod agendado. (Confirmado neste cluster: a `standard` usa `WaitForFirstConsumer`, e o evento do PVC é literalmente `WaitForFirstConsumer: waiting for first consumer to be created before binding`.)
+
+> O Deployment do Prometheus usa `strategy: Recreate` de propósito: o PVC é `ReadWriteOnce`, então o pod novo não conseguiria montar o volume enquanto o antigo o estivesse usando (ou, num provisioner local onde o `ReadWriteOnce` não é imposto, montaria o mesmo caminho por cima do primeiro, com risco para o TSDB). O rollout ficaria **preso** esperando o novo pod ficar `Ready` — e, como no rolling update o pod antigo não é removido antes disso, a troca nunca terminaria.
+
+### Acessar os painéis (port-forward)
+
+Nenhum dos dois tem `EXTERNAL-IP`: o acesso é por `port-forward`, em **dois terminais**. As portas locais (`19090` e `13000`) são diferentes das do Kong (`8000`/`8001`/`8100`), então todos os forwards podem ficar ativos ao mesmo tempo:
+
+```bash
+kubectl port-forward svc/prometheus 19090:9090   # http://localhost:19090
+kubectl port-forward svc/grafana 13000:3000      # http://localhost:13000  (admin / senha do Secret)
+```
+
+No Grafana o dashboard **FCG - APIs** já aparece no menu (provisionado por ConfigMap) e o login é `admin` com a senha que você pôs no `Secret grafana-admin`. No Prometheus, `Status → Targets` mostra os alvos. Com o forward ativo, dá para conferir a coleta sem abrir o Grafana:
+
+```bash
+# os alvos do job fcg-apis (users-api e catalog-api) devem aparecer com "health":"up"
+curl -s "http://localhost:19090/api/v1/targets?state=active"
+
+# série de fato coletada — é o nome de métrica usado pelos painéis
+curl -s "http://localhost:19090/api/v1/query?query=http_requests_received_total"
+```
+
+> No **PowerShell**, `curl` resolve para o alias de `Invoke-WebRequest` e esses comandos falham — use `curl.exe -s` (o `curl.exe` do Windows 10/11 é o `curl` de verdade). O mesmo cuidado vale para os exemplos de `curl` deste README.
+
+### Gerar tráfego para os painéis
+
+Os painéis ficam vazios enquanto não houver requisição: use o fluxo de [Acessar as APIs](#acessar-as-apis) — cadastro, login e chamadas autenticadas pelo gateway em `http://localhost:8000`. Cada execução movimenta `users-api` e `catalog-api`: as chamadas que chegam às APIs aparecem no painel de status code — inclusive as anônimas que falham por credencial, como `POST /api/auth/login` de um usuário **existente** com a senha incorreta, que aparece como `401` (já o e-mail inexistente responde `400`, pelo contrato do endpoint). Os `401` rejeitados **no gateway** (chamadas sem token) **não** aparecem, porque o Kong responde antes de encaminhar: o gateway não é instrumentado nesta fase — a Opção A instrumenta `users-api` e `catalog-api`.
+
+### Alterar o scrape exige restart do Prometheus
+
+O Prometheus **não recarrega** o `prometheus.yml` sozinho: o arquivo é lido uma única vez, na inicialização do processo, e não há sidecar de reload (nem `--web.enable-lifecycle`). Depois de mudar `k8s/prometheus-configmap.yaml`:
+
+```bash
+kubectl apply -f k8s/prometheus-configmap.yaml
+kubectl rollout restart deployment/prometheus   # sem isso a config antiga continua valendo
+```
+
+> A lógica é a mesma do Kong DB-less ([Configurar o gateway](#configurar-o-gateway-segredo-jwt)): a configuração montada só passa a valer no próximo start do processo.
+
+### Alterar a provisão do Grafana (semântica de reload)
+
+Os dois ConfigMaps do Grafana **não** têm a mesma semântica de reload:
+
+- **Dashboard** (`k8s/grafana-dashboards-configmap.yaml`) — **propaga sozinho**: o provider `fcg` é do tipo `file` com `updateIntervalSeconds: 30` (ver `dashboards.yml` em `k8s/grafana-configmap.yaml`), então o Grafana relê os arquivos de `/var/lib/grafana/dashboards` a cada **30s**. Depois do apply, basta esperar o kubelet atualizar o volume montado do ConfigMap (até ~1 min) e o dashboard novo aparece — **não** é preciso reiniciar pod algum.
+- **Datasource e provider** (`k8s/grafana-configmap.yaml`) — **exige restart do pod**: essa metade da provisão é lida uma única vez, no boot do Grafana. Sem restart, o arquivo novo fica montado e **ignorado**.
+
+```bash
+kubectl apply -f k8s/grafana-dashboards-configmap.yaml   # propaga sozinho (provider relê a cada 30s)
+kubectl apply -f k8s/grafana-configmap.yaml              # só passa a valer no próximo boot:
+kubectl rollout restart deployment/grafana
+```
+
 ## Estrutura de arquivos
 
 ```
@@ -387,6 +489,11 @@ fcg-orchestration/
 │   ├── payments-api-deployment.yaml
 │   ├── notifications-api-configmap.yaml
 │   ├── notifications-api-deployment.yaml
+│   ├── prometheus-configmap.yaml
+│   ├── prometheus-deployment.yaml
+│   ├── grafana-configmap.yaml
+│   ├── grafana-dashboards-configmap.yaml
+│   ├── grafana-deployment.yaml
 │   └── kong/
 │       ├── kong-deployment.yaml      # Deployment + Service (proxy 8000; Admin 8001 e Status 8100 só no pod)
 │       └── kong.yml.template         # config declarativa com o marcador ${JWT_SECRET}
