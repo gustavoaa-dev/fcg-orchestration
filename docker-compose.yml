@@ -88,20 +88,6 @@ services:
     networks:
       - fcg-network
 
-  notifications-api:
-    build:
-      context: ../fcg-notifications-api
-      dockerfile: Dockerfile
-    container_name: notifications-api
-    environment:
-      ASPNETCORE_ENVIRONMENT: Development
-      RABBITMQ_HOST: rabbitmq
-    depends_on:
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - fcg-network
-
 networks:
   fcg-network:
     driver: bridge
