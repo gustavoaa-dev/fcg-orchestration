@@ -8,3 +8,4 @@ data:
   Jwt__Issuer: "FCG.UsersAPI"
   Jwt__Audience: "FCG.Client"
   Mongo__DatabaseName: "fcg_catalog"
+  Redis__ConnectionString: "redis:6379"
