@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: catalog-api
-          image: fcg-catalog-api:sp3-0fc433d
+          image: fcg-catalog-api:sp3-0a6911f
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
