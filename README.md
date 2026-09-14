@@ -109,36 +109,44 @@ O Kong é **DB-less**: a configuração declarativa é montada a partir de um `S
 
 ```powershell
 # Lê o segredo users-api-secret/jwt-secret-key, renderiza o template,
-# cria/atualiza o Secret kong-declarative-config e reinicia o Kong.
-powershell -File scripts/deploy-kong.ps1
+# cria/atualiza o Secret kong-declarative-config, reinicia o Kong e espera o rollout.
+powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1
 ```
 
-> A invocação suportada é `powershell -File scripts/deploy-kong.ps1`. Em quem tiver PowerShell 7, a alternativa é `pwsh -File scripts/deploy-kong.ps1` — o script é agnóstico de versão.
+> A invocação suportada é `powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1`. O `-ExecutionPolicy Bypass` é necessário porque o Windows client vem com a política de execução `Restricted`, que bloqueia arquivos `.ps1` (o `-File` puro falha com "a execução de scripts foi desabilitada neste sistema"). Em quem tiver PowerShell 7, a alternativa equivalente é `pwsh -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1` — o script é agnóstico de versão.
 
-**Sem esse restart a mudança de configuração não vale**: em modo DB-less o Kong carrega a config declarativa na inicialização do pod.
+**Sem esse restart a mudança de configuração não vale**: em modo DB-less o Kong carrega a config declarativa na inicialização do pod. Por isso o script não termina no `rollout restart`: ele espera o `kubectl rollout status deployment/kong` e **falha** se o pod não ficar pronto em 120s (config inválida em DB-less mata o container no boot e vira `CrashLoopBackOff`, sem que o restart acuse erro).
 
 ### Expor o gateway (porta de entrada)
 
-O Service do Kong é `LoadBalancer`, e nem todo cluster entrega um `EXTERNAL-IP` local — confira sempre:
+O Service do Kong é `LoadBalancer`, e **nem todo cluster entrega um `EXTERNAL-IP` local**: o Docker Desktop, inclusive, ora publica `localhost`, ora entrega um **IP de rede** (na verificação real desta máquina ele devolveu `172.18.0.5`). Confira sempre o que o seu cluster imprimiu:
 
 ```bash
 kubectl get svc kong
 ```
 
-| Cluster | `EXTERNAL-IP` do `svc/kong` | Como chegar em `http://localhost:8000` |
+| Cluster | `EXTERNAL-IP` típico do `svc/kong` | Como chegar ao gateway |
 |---|---|---|
-| **Docker Desktop** (decisão do projeto) | `localhost` | direto, sem passo extra |
+| **Docker Desktop** (decisão do projeto) | `localhost` **ou um IP de rede** (ex.: `172.18.0.5`) | `localhost` → direto em `http://localhost:8000`; **IP de rede** → `http://<EXTERNAL-IP>:8000` (se o host não alcançar esse IP, use o `port-forward` abaixo e `http://localhost:8000`) |
 | **Minikube** | `<pending>` | rodar `minikube tunnel` em um terminal separado e mantê-lo aberto |
 | **Kind** | `<pending>` (não há load balancer) | usar o `port-forward` abaixo |
 | Qualquer cluster | `<pending>` | **fallback universal:** `kubectl port-forward svc/kong 8000:8000` |
 
+O procedimento correto, em qualquer cluster, é nesta ordem:
+
+1. leia o `EXTERNAL-IP` impresso por `kubectl get svc kong`;
+2. se ele for um endereço alcançável do host, use **`http://<EXTERNAL-IP>:8000`** (com `localhost` isso é simplesmente `http://localhost:8000`);
+3. se **não** for alcançável do host (ou estiver `<pending>`), use o **fallback universal** abaixo — e só então a URL é `http://localhost:8000`.
+
 ```bash
 # Fallback universal: funciona em qualquer cluster, com ou sem EXTERNAL-IP.
-# Deixe rodando em um terminal separado — a URL segue sendo http://localhost:8000.
+# Deixe rodando em um terminal separado — com o forward ativo a URL é http://localhost:8000.
 kubectl port-forward svc/kong 8000:8000
 ```
 
-Como o Kong publica apenas a porta `8000` (a Admin API `8001` não é exposta), o `port-forward` do proxy não conflita com o da Admin API documentado em [Depurar (port-forward)](#depurar-port-forward).
+Nos exemplos deste README, **`http://localhost:8000` vale quando o `port-forward` está ativo ou quando o `EXTERNAL-IP` do `svc/kong` é `localhost`**; nos demais casos, troque a base da URL pelo `EXTERNAL-IP` — os dois blocos de exemplo abaixo já trazem uma variável (`$gateway` / `$GATEWAY`) só para isso.
+
+Como o Kong publica apenas a porta `8000`, o `port-forward` do proxy não conflita com nenhum outro: a Admin API (`8001`) e a Status API (`8100`) **não são publicadas no Service** (ver [Depurar (port-forward)](#depurar-port-forward)).
 
 ### Verificar o deploy
 
@@ -154,23 +162,28 @@ Confirme também que as APIs ficaram fechadas: `users-api` e `catalog-api` apare
 
 E confirme a exposição do gateway em `kubectl get svc kong`:
 
-- `EXTERNAL-IP` = `localhost` → o gateway já responde em `http://localhost:8000` (caso do Docker Desktop);
+- `EXTERNAL-IP` = `localhost` → o gateway já responde em `http://localhost:8000`;
+- `EXTERNAL-IP` = um **IP de rede** (ex.: `172.18.0.5`, caso já observado no Docker Desktop) → use `http://<EXTERNAL-IP>:8000`; se esse IP não for alcançável do host, aplique o **fallback universal** `kubectl port-forward svc/kong 8000:8000` e volte para `http://localhost:8000`;
 - `EXTERNAL-IP` = `<pending>` → aplique o passo de exposição do cluster (`minikube tunnel`) ou o **fallback universal** `kubectl port-forward svc/kong 8000:8000` antes de seguir para os exemplos.
 
 ### Acessar as APIs
 
-Tudo passa pelo gateway: **`http://localhost:8000`** — com Docker Desktop direto, ou via o `port-forward svc/kong 8000:8000` descrito acima nos demais clusters.
+Tudo passa pelo gateway, e a base da URL é **o que o `EXTERNAL-IP` do `svc/kong` mandar** ([exposição por cluster](#expor-o-gateway-porta-de-entrada)): `http://localhost:8000` quando o `EXTERNAL-IP` for `localhost` ou quando o `port-forward svc/kong 8000:8000` estiver ativo; `http://<EXTERNAL-IP>:8000` quando o cluster entregar um IP de rede alcançável do host. Os exemplos usam a variável `$gateway` / `$GATEWAY` exatamente para essa troca — os valores esperados não mudam.
 
 O fluxo é **autocontido** e sempre na mesma sessão do terminal: **cadastrar → logar (capturando o token) → chamar a rota protegida**. O token não é reaproveitado entre passos nem entre blocos.
 
 #### Variante A — PowerShell nativo (Windows, sem dependências)
 
 ```powershell
+# Base do gateway: troque por http://<EXTERNAL-IP>:8000 se o EXTERNAL-IP do svc/kong
+# nao for "localhost" (ver "Expor o gateway"). Com port-forward ativo, mantenha localhost.
+$gateway = "http://localhost:8000"
+
 # 1) Cadastro (POST /api/usuarios é rota ANÔNIMA). Senha: mínimo de 8 caracteres,
 #    com ao menos uma letra, um dígito e um caractere especial. Esperado: 201.
 $corpoCadastro = @{ nome = "Jogador FCG"; email = "jogador@fcg.com"; senha = "Senha@123" } | ConvertTo-Json
 try {
-    Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/usuarios `
+    Invoke-RestMethod -Method Post -Uri "$gateway/api/usuarios" `
         -ContentType "application/json" -Body $corpoCadastro | Out-Null
     Write-Host "cadastro=201"
 } catch {
@@ -180,19 +193,19 @@ try {
 
 # 2) Login (POST /api/auth/login é rota ANÔNIMA) e captura do token NA MESMA SESSÃO.
 $corpoLogin = @{ email = "jogador@fcg.com"; senha = "Senha@123" } | ConvertTo-Json
-$token = (Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/auth/login `
+$token = (Invoke-RestMethod -Method Post -Uri "$gateway/api/auth/login" `
     -ContentType "application/json" -Body $corpoLogin).token
 
 # 3) Rota protegida SEM token -> o gateway responde 401
 try {
-    Invoke-WebRequest -Uri http://localhost:8000/api/jogos -UseBasicParsing | Out-Null
+    Invoke-WebRequest -Uri "$gateway/api/jogos" -UseBasicParsing | Out-Null
     Write-Host "sem-token=200 (inesperado)"
 } catch {
     Write-Host "sem-token=$($_.Exception.Response.StatusCode.value__)"
 }
 
 # 4) Rota protegida COM token -> 200
-$respostaComToken = Invoke-WebRequest -Uri http://localhost:8000/api/jogos `
+$respostaComToken = Invoke-WebRequest -Uri "$gateway/api/jogos" `
     -Headers @{ Authorization = "Bearer $token" } -UseBasicParsing
 Write-Host "com-token=$($respostaComToken.StatusCode)"
 ```
@@ -204,22 +217,26 @@ Esperado: `cadastro=201`, `sem-token=401`, `com-token=200` (numa segunda execuç
 #### Variante B — bash (`curl` + `jq`, em Git Bash ou WSL)
 
 ```bash
+# Base do gateway: troque por http://<EXTERNAL-IP>:8000 se o EXTERNAL-IP do svc/kong
+# nao for "localhost" (ver "Expor o gateway"). Com port-forward ativo, mantenha localhost.
+GATEWAY="${GATEWAY:-http://localhost:8000}"
+
 # 1) Cadastro (rota ANÔNIMA). Esperado: 201
-curl -s -o /dev/null -w "cadastro=%{http_code}\n" -X POST http://localhost:8000/api/usuarios \
+curl -s -o /dev/null -w "cadastro=%{http_code}\n" -X POST "$GATEWAY/api/usuarios" \
   -H "Content-Type: application/json" \
   -d '{"nome":"Jogador FCG","email":"jogador@fcg.com","senha":"Senha@123"}'
 
 # 2) Login (rota ANÔNIMA) e captura do token NO MESMO BLOCO.
 #    O jq extrai o campo "token" da resposta { "token": "..." }.
-TOKEN=$(curl -s -X POST http://localhost:8000/api/auth/login \
+TOKEN=$(curl -s -X POST "$GATEWAY/api/auth/login" \
   -H "Content-Type: application/json" \
   -d '{"email":"jogador@fcg.com","senha":"Senha@123"}' | jq -r '.token')
 
 # 3) Rota protegida SEM token -> 401
-curl -s -o /dev/null -w "sem-token=%{http_code}\n" http://localhost:8000/api/jogos
+curl -s -o /dev/null -w "sem-token=%{http_code}\n" "$GATEWAY/api/jogos"
 
 # 4) Rota protegida COM token -> 200
-curl -s -o /dev/null -w "com-token=%{http_code}\n" http://localhost:8000/api/jogos \
+curl -s -o /dev/null -w "com-token=%{http_code}\n" "$GATEWAY/api/jogos" \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -235,10 +252,14 @@ O gateway é a única entrada suportada; os comandos abaixo servem **apenas para
 # Bypass do gateway para inspecionar uma API direto no pod (só na sua máquina)
 kubectl port-forward svc/users-api 8080:80
 
-# Admin API do Kong — a porta 8001 NÃO é publicada, só existe via port-forward
-kubectl port-forward deploy/kong 8001:8001
-# com o forward ativo, abra http://localhost:8001/status (ou /routes, /services, /plugins)
+# Admin API do Kong — NÃO é publicada no Service e escuta apenas em 127.0.0.1 dentro
+# do pod, então o acesso é por dentro dele (nem `kubectl port-forward` alcança o loopback):
+kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status
+# para ver as rotas carregadas da config declarativa:
+kubectl exec -it deploy/kong -- curl -s http://localhost:8001/routes
 ```
+
+> A Admin API é consultada **por dentro do pod** de propósito: em DB-less o `GET /` devolve a configuração declarativa inteira, incluindo o `secret` HMAC do consumer — mantê-la só no loopback evita que qualquer pod do cluster leia a chave e forje tokens.
 
 ### Remover o deploy
 
@@ -260,9 +281,9 @@ O [Kong 3.10](https://konghq.com/) em modo **DB-less** é o ponto de entrada ún
 | Config declarativa | `k8s/kong/kong.yml.template` | Serviços, rotas, plugin `jwt` e consumer — versionado, com o marcador `${JWT_SECRET}` no lugar do segredo |
 | Deployment + Service | `k8s/kong/kong-deployment.yaml` | Kong `3.10` com `KONG_DATABASE=off`, proxy em `0.0.0.0:8000`; Service `LoadBalancer` publicando **apenas** a porta `8000` |
 | Config renderizada | `Secret kong-declarative-config` (cluster) | `kong.yml` final, montado somente leitura em `/kong/declarative/kong.yml` |
-| Script de deploy | `scripts/deploy-kong.ps1` | Renderiza o template, aplica o `Secret` e reinicia o Kong |
+| Script de deploy | `scripts/deploy-kong.ps1` | Renderiza o template, aplica o `Secret`, reinicia o Kong e espera o rollout |
 
-A Admin API (`8001`) **não é publicada**: só é acessível por `kubectl port-forward deploy/kong 8001:8001` (ver [Depurar (port-forward)](#depurar-port-forward)).
+A Admin API (`8001`) **não é publicada no Service** e escuta apenas em `127.0.0.1` **dentro do pod** — o acesso é por `kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status` (ver [Depurar (port-forward)](#depurar-port-forward)). As probes usam a Status API (`8100`), que também não é publicada.
 
 ### Como o segredo JWT é injetado
 
@@ -271,9 +292,9 @@ O `kong.yml` final **nunca** vai para o git — o repositório guarda apenas o t
 1. `scripts/deploy-kong.ps1` lê o segredo que já existe no cluster (`Secret users-api-secret`, chave `jwt-secret-key` — o mesmo usado pelas APIs);
 2. substitui `${JWT_SECRET}` no template e grava o resultado num arquivo temporário em **UTF-8 sem BOM** (com BOM, o Kong pode falhar no parse da config declarativa);
 3. cria/atualiza o `Secret kong-declarative-config` (`kubectl create secret generic ... --dry-run=client -o yaml | kubectl apply -f -`);
-4. reinicia o Deployment do Kong e apaga o arquivo temporário (que contém o segredo em claro).
+4. reinicia o Deployment do Kong, **espera o `kubectl rollout status`** (se o Kong não ficar pronto, o script lança erro em vez de anunciar sucesso) e apaga o arquivo temporário (que contém o segredo em claro).
 
-Invocação suportada: **`powershell -File scripts/deploy-kong.ps1`** (alternativa em quem tem PowerShell 7: `pwsh -File scripts/deploy-kong.ps1`). Como o Kong é DB-less, **a configuração só passa a valer depois do restart feito pelo script**.
+Invocação suportada: **`powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1`** (alternativa em quem tem PowerShell 7: `pwsh -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1`). Como o Kong é DB-less, **a configuração só passa a valer depois do restart feito pelo script**.
 
 ### Rotas expostas
 
@@ -298,7 +319,7 @@ Os upstreams são internos: `users-api` e `catalog-api` são `ClusterIP` na port
 Contratos das rotas anônimas (as únicas que dispensam token):
 
 - `POST /api/usuarios` (cadastro) — corpo `{"nome": "...", "email": "...", "senha": "..."}` (`CriarUsuarioDTO`); a senha precisa ter no mínimo 8 caracteres, com ao menos uma letra, um dígito e um caractere especial; responde `201` no sucesso e `400` se o e-mail já existir ou o payload for inválido. Exemplo executável em [Acessar as APIs](#acessar-as-apis).
-- `POST /api/auth/login` — corpo `{"email": "...", "senha": "..."}` (`LoginDTO`); responde `200` com `{ "token": "..." }` ou `401` se as credenciais forem inválidas.
+- `POST /api/auth/login` — corpo `{"email": "...", "senha": "..."}` (`LoginDTO`); responde `200` com o token, `401` se a senha estiver incorreta e `400` se o e-mail não existir ou o payload for inválido.
 
 ### Aviso: não definir porta HTTPS nos serviços
 
@@ -312,9 +333,13 @@ Portanto: **não defina porta HTTPS nos Deployments/ConfigMaps das APIs, nem pub
 ### Depurar o gateway
 
 ```bash
-# Admin API do Kong (a 8001 não é publicada)
-kubectl port-forward deploy/kong 8001:8001
-# depois abra http://localhost:8001/status | /routes | /services | /plugins | /consumers
+# Admin API do Kong — só existe em 127.0.0.1 dentro do pod (não é publicada no Service
+# nem alcançável por port-forward, que fala com o IP do pod e não com o loopback):
+kubectl exec -it deploy/kong -- curl -s http://localhost:8001/status
+kubectl exec -it deploy/kong -- curl -s http://localhost:8001/routes   # /services | /plugins | /consumers
+
+# Status API (8100) — a mesma que as probes usam; também não é publicada
+kubectl exec -it deploy/kong -- curl -s http://localhost:8100/status/ready
 
 # Logs do Kong (mostram o 401/200 de cada requisição)
 kubectl logs deploy/kong -f
@@ -340,9 +365,9 @@ fcg-orchestration/
 │   ├── notifications-api-configmap.yaml
 │   ├── notifications-api-deployment.yaml
 │   └── kong/
-│       ├── kong-deployment.yaml      # Deployment + Service (proxy 8000, Admin 8001 interna)
+│       ├── kong-deployment.yaml      # Deployment + Service (proxy 8000; Admin 8001 e Status 8100 só no pod)
 │       └── kong.yml.template         # config declarativa com o marcador ${JWT_SECRET}
 ├── scripts/
-│   └── deploy-kong.ps1               # renderiza o segredo e reinicia o Kong
+│   └── deploy-kong.ps1               # renderiza o segredo, reinicia o Kong e espera o rollout
 └── README.md
 ```
