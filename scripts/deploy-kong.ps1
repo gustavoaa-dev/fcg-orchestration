@@ -16,9 +16,15 @@ if (-not $secretBase64) {
 }
 $jwtSecret = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($secretBase64))
 
+# O segredo entra no YAML dentro de quotes: uma quebra de linha geraria YAML invalido
+# (e em DB-less o Kong sairia no prepare, virando CrashLoopBackOff).
+if ($jwtSecret -match "[`r`n]") { throw "segredo com quebra de linha" }
+
 $rendered = (Get-Content -Path $templatePath -Raw).Replace('${JWT_SECRET}', $jwtSecret)
 # GetTempPath() em vez de $env:TEMP: $env:TEMP pode ser nulo em contexto de servico.
-$renderedPath = Join-Path ([System.IO.Path]::GetTempPath()) 'kong-rendered.yml'
+# Nome aleatorio: um nome fixo poderia ser lido por outro processo ou deixado para tras
+# por uma execucao concorrente.
+$renderedPath = Join-Path ([System.IO.Path]::GetTempPath()) ("kong-rendered-{0}.yml" -f [guid]::NewGuid().ToString('N'))
 
 try {
     # UTF8Encoding($false) = UTF-8 sem BOM, independente da versao do PowerShell.
@@ -32,10 +38,16 @@ try {
 
     kubectl rollout restart deployment/kong
     if ($LASTEXITCODE -ne 0) { throw "kubectl falhou (exit $LASTEXITCODE)" }
+
+    # O restart sozinho sempre retorna 0 se o Deployment existe: em DB-less uma config
+    # invalida mata o pod durante o 'kong prepare' (CrashLoopBackOff) e o operador
+    # receberia sucesso com o Kong no chao. Esperar o rollout expoe essa falha.
+    kubectl rollout status deployment/kong --timeout=120s
+    if ($LASTEXITCODE -ne 0) { throw "Kong nao ficou pronto apos o restart; veja: kubectl logs deploy/kong" }
 }
 finally {
     # O temporario contem o segredo em claro: remover sempre, inclusive se o kubectl falhar.
     if (Test-Path $renderedPath) { Remove-Item $renderedPath -Force }
 }
 
-Write-Host "Secret kong-declarative-config atualizado e Kong reiniciado (kubectl exit 0 em ambos os passos)."
+Write-Host "Secret kong-declarative-config atualizado e Kong reiniciado com o rollout verificado."
