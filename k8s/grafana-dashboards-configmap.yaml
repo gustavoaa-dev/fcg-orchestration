@@ -59,7 +59,7 @@ data:
             {
               "refId": "status",
               "legendFormat": "{{code}}",
-              "expr": "sum by (code) (rate(http_requests_received_total[5m]))"
+              "expr": "sum by (code) (rate(http_requests_received_total{endpoint!=\"/health\"}[5m]))"
             }
           ]
         },
@@ -73,7 +73,7 @@ data:
             {
               "refId": "erros",
               "legendFormat": "% 5xx",
-              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total{endpoint!=\"/health\"}[5m])), 1e-9) or vector(0)"
+              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\",endpoint!=\"/health\"}[5m])) / clamp_min(sum(rate(http_requests_received_total{endpoint!=\"/health\"}[5m])), 1e-9) or vector(0)"
             }
           ]
         },
