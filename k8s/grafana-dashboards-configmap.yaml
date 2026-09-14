@@ -73,7 +73,7 @@ data:
             {
               "refId": "erros",
               "legendFormat": "% 5xx",
-              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total[5m])), 1e-9)"
+              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total[5m])), 1e-9) or vector(0)"
             }
           ]
         }
