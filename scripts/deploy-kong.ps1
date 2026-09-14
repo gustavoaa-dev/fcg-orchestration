@@ -17,14 +17,25 @@ if (-not $secretBase64) {
 $jwtSecret = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($secretBase64))
 
 $rendered = (Get-Content -Path $templatePath -Raw).Replace('${JWT_SECRET}', $jwtSecret)
-$renderedPath = Join-Path $env:TEMP 'kong-rendered.yml'
-Set-Content -Path $renderedPath -Value $rendered -Encoding UTF8 -NoNewline
+# GetTempPath() em vez de $env:TEMP: $env:TEMP pode ser nulo em contexto de servico.
+$renderedPath = Join-Path ([System.IO.Path]::GetTempPath()) 'kong-rendered.yml'
 
-kubectl create secret generic kong-declarative-config `
-    --from-file=kong.yml=$renderedPath `
-    --dry-run=client -o yaml | kubectl apply -f -
+try {
+    # UTF8Encoding($false) = UTF-8 sem BOM, independente da versao do PowerShell.
+    # Com BOM, o kong.yml montado no container pode falhar no parse da config declarativa.
+    [System.IO.File]::WriteAllText($renderedPath, $rendered, (New-Object System.Text.UTF8Encoding($false)))
 
-Remove-Item $renderedPath -Force
+    kubectl create secret generic kong-declarative-config `
+        --from-file=kong.yml=$renderedPath `
+        --dry-run=client -o yaml | kubectl apply -f -
+    if ($LASTEXITCODE -ne 0) { throw "kubectl falhou (exit $LASTEXITCODE)" }
 
-kubectl rollout restart deployment/kong
-Write-Host "Secret kong-declarative-config atualizado e Kong reiniciado."
+    kubectl rollout restart deployment/kong
+    if ($LASTEXITCODE -ne 0) { throw "kubectl falhou (exit $LASTEXITCODE)" }
+}
+finally {
+    # O temporario contem o segredo em claro: remover sempre, inclusive se o kubectl falhar.
+    if (Test-Path $renderedPath) { Remove-Item $renderedPath -Force }
+}
+
+Write-Host "Secret kong-declarative-config atualizado e Kong reiniciado (kubectl exit 0 em ambos os passos)."
