@@ -25,13 +25,13 @@ data:
           "targets": [
             {
               "refId": "p95",
-              "legendFormat": "p95 {{instance}}",
-              "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))"
+              "legendFormat": "p95 {{endpoint}}",
+              "expr": "histogram_quantile(0.95, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket{endpoint!=\"/health\"}[5m])))"
             },
             {
               "refId": "p50",
-              "legendFormat": "p50 {{instance}}",
-              "expr": "histogram_quantile(0.50, sum by (le, instance) (rate(http_request_duration_seconds_bucket[5m])))"
+              "legendFormat": "p50 {{endpoint}}",
+              "expr": "histogram_quantile(0.50, sum by (le, endpoint) (rate(http_request_duration_seconds_bucket{endpoint!=\"/health\"}[5m])))"
             }
           ]
         },
@@ -44,8 +44,8 @@ data:
           "targets": [
             {
               "refId": "rps",
-              "legendFormat": "{{instance}}",
-              "expr": "sum by (instance) (rate(http_requests_received_total[5m]))"
+              "legendFormat": "{{endpoint}}",
+              "expr": "sum by (endpoint) (rate(http_requests_received_total{endpoint!=\"/health\"}[5m]))"
             }
           ]
         },
@@ -73,7 +73,21 @@ data:
             {
               "refId": "erros",
               "legendFormat": "% 5xx",
-              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total[5m])), 1e-9) or vector(0)"
+              "expr": "100 * sum(rate(http_requests_received_total{code=~\"5..\"}[5m])) / clamp_min(sum(rate(http_requests_received_total{endpoint!=\"/health\"}[5m])), 1e-9) or vector(0)"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Coleta do Prometheus (up)",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1 }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "up",
+              "legendFormat": "{{instance}}",
+              "expr": "up{job=\"fcg-apis\"}"
             }
           ]
         }
