@@ -65,7 +65,7 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 
 > As portas `5001`–`5004` das APIs não existem mais: os containers das APIs não publicam porta alguma no host.
 
-> Prometheus e Grafana também ficam **fechados dentro do cluster**: o gateway Kong roteia apenas `/api/*`, e os dois Services são `ClusterIP` sem `EXTERNAL-IP` — chega-se a eles só por `port-forward`, nas portas locais `19090` e `13000` (ver [Observabilidade](#observabilidade)).
+> Prometheus e Grafana também ficam **fechados dentro do cluster**: o gateway Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), e os dois Services são `ClusterIP` sem `EXTERNAL-IP` — chega-se a eles só por `port-forward`, nas portas locais `19090` e `13000` (ver [Observabilidade](#observabilidade)).
 
 ### Parar a aplicação
 
@@ -390,7 +390,7 @@ A stack escolhida para esta fase é a **Opção A — Prometheus + Grafana**: as
 - **Instrumentação:** `users-api` e `catalog-api` expõem `/metrics` (biblioteca `prometheus-net` 8.2.1) e `/health`. O `UseHttpMetrics()` é registrado antes dos demais middlewares, então erros de autenticação e exceções também entram nas métricas. As probes `startup`/`readiness`/`liveness` dos dois Deployments apontam para `/health:8080`.
 - **Coleta:** o Prometheus raspa `users-api:80` e `catalog-api:80` (job `fcg-apis`, `metrics_path: /metrics`) a cada **15s** (`k8s/prometheus-configmap.yaml`), além de a si mesmo em `localhost:9090`, e guarda **7 dias** de dados em volume persistente (`--storage.tsdb.retention.time=7d`, PVC `prometheus-data`, 2Gi).
 - **Visualização:** o Grafana sobe com datasource e dashboard **provisionados por ConfigMap** (`k8s/grafana-configmap.yaml` e `k8s/grafana-dashboards-configmap.yaml`) — nada é cadastrado à mão na interface. O datasource `Prometheus` (`uid: prometheus`) aponta para `http://prometheus:9090`, e o dashboard **FCG - APIs** (`uid: fcg-apis`) traz latência (p50/p95), requisições por segundo, requisições por status code e taxa de erro 5xx — todos derivados de `http_request_duration_seconds_bucket` e `http_requests_received_total`, coletados na porta `/metrics` das APIs.
-- **Exposição:** nenhum dos dois é publicado pelo gateway — ambos são `ClusterIP` e o acesso é por `port-forward` (veja abaixo). O Kong só roteia `/api/*`, então `/metrics` e `/health` não saem do cluster (o mesmo vale para a interface do Prometheus e a do Grafana). O aviso de [não definir porta HTTPS nos serviços](#aviso-não-definir-porta-https-nos-serviços) continua valendo para os dois.
+- **Exposição:** nenhum dos dois é publicado pelo gateway — ambos são `ClusterIP` e o acesso é por `port-forward` (veja abaixo). O Kong roteia apenas quatro prefixos (`/api/auth`, `/api/usuarios`, `/api/jogos` e `/api/biblioteca`), então `/metrics` e `/health` não saem do cluster (o mesmo vale para a interface do Prometheus e a do Grafana).
 - **Senha do Grafana:** o login é `admin` e a senha vem do `Secret` `grafana-admin` (chave `admin-password`) — que **nunca** vai para o git. As demais configurações do Grafana são fixas no manifesto, entre elas `GF_USERS_ALLOW_SIGN_UP=false`.
 - **Persistência do Grafana:** o container monta `emptyDir` em `/var/lib/grafana`, então nada daí sobrevive a um restart do pod. Isso não afeta datasource nem dashboard — os dois são **recriados pela provisão a cada start** (é o que a montagem por ConfigMap garante) —, mas dados criados pela UI (usuários extras, snapshots, preferências) **são perdidos**: trate os manifestos de provisionamento como a fonte de verdade e não conte com a interface para o que precisa durar.
 
@@ -444,7 +444,7 @@ curl -s "http://localhost:19090/api/v1/query?query=http_requests_received_total"
 
 ### Gerar tráfego para os painéis
 
-Os painéis ficam vazios enquanto não houver requisição: use o fluxo de [Acessar as APIs](#acessar-as-apis) — cadastro, login e chamadas autenticadas pelo gateway em `http://localhost:8000`. Cada execução movimenta `users-api` e `catalog-api`, inclusive os `401` das chamadas sem token, que aparecem no painel de status code.
+Os painéis ficam vazios enquanto não houver requisição: use o fluxo de [Acessar as APIs](#acessar-as-apis) — cadastro, login e chamadas autenticadas pelo gateway em `http://localhost:8000`. Cada execução movimenta `users-api` e `catalog-api`: as chamadas que chegam às APIs aparecem no painel de status code — inclusive as anônimas que falham por credencial, como `POST /api/auth/login` com senha errada, que aparecem como `401`. Os `401` rejeitados **no gateway** (chamadas sem token) **não** aparecem, porque o Kong responde antes de encaminhar: o gateway não é instrumentado nesta fase — a Opção A instrumenta `users-api` e `catalog-api`.
 
 ### Alterar o scrape exige restart do Prometheus
 
@@ -456,6 +456,19 @@ kubectl rollout restart deployment/prometheus   # sem isso a config antiga conti
 ```
 
 > A lógica é a mesma do Kong DB-less ([Configurar o gateway](#configurar-o-gateway-segredo-jwt)): a configuração montada só passa a valer no próximo start do processo.
+
+### Alterar a provisão do Grafana (semântica de reload)
+
+Os dois ConfigMaps do Grafana **não** têm a mesma semântica de reload:
+
+- **Dashboard** (`k8s/grafana-dashboards-configmap.yaml`) — **propaga sozinho**: o provider `fcg` é do tipo `file` com `updateIntervalSeconds: 30` (ver `dashboards.yml` em `k8s/grafana-configmap.yaml`), então o Grafana relê os arquivos de `/var/lib/grafana/dashboards` a cada **30s**. Depois do apply, basta esperar o kubelet atualizar o volume montado do ConfigMap (até ~1 min) e o dashboard novo aparece — **não** é preciso reiniciar pod algum.
+- **Datasource e provider** (`k8s/grafana-configmap.yaml`) — **exige restart do pod**: essa metade da provisão é lida uma única vez, no boot do Grafana. Sem restart, o arquivo novo fica montado e **ignorado**.
+
+```bash
+kubectl apply -f k8s/grafana-dashboards-configmap.yaml   # propaga sozinho (provider relê a cada 30s)
+kubectl apply -f k8s/grafana-configmap.yaml              # só passa a valer no próximo boot:
+kubectl rollout restart deployment/grafana
+```
 
 ## Estrutura de arquivos
 
