@@ -183,7 +183,7 @@ TUDO PRONTO PARA GRAVAR O MODULO 2
 
 (o número de caracteres do token varia com e-mail/senha — o que importa é existir. Se o preparo tiver criado o usuário demo, ele avisa em três linhas `*** AVISO ***`: isso só acontece em cluster novo.)
 
-**Na tela, deixe pronto:** **dois terminais** abertos em `fcg-orchestration` — **T1** (o dos comandos, onde o preparo rodou e onde você vai digitar) e **T3** (o do `port-forward`, ocupado até o fim do módulo). O T1 precisa ter `$env:FCG_DEMO_SENHA` na sessão. `Clear-Host` nos dois antes de apertar REC.
+**Na tela, deixe pronto:** **dois terminais** abertos em `fcg-orchestration` — **T1** (o dos comandos, onde o preparo rodou e onde você vai digitar) e **T3** (o do `port-forward`, ocupado até o fim do módulo). O T1 precisa ter `$env:FCG_DEMO_SENHA` na sessão. **Rode o preparo antes de subir o `port-forward`**: ele exige a porta **8001 livre**, porque o `port-forward` é desta tomada. `Clear-Host` nos dois antes de apertar REC.
 
 > **Não existe T2 neste módulo** — e isso é de propósito. A numeração dos terminais é fixa no roteiro inteiro, para você nunca ter de adivinhar qual janela é qual: o **T2** é o `kubectl get ... -w` do **módulo 3** e o **T3** é o `port-forward` (aqui o da Admin API do Kong, nos módulos 3 e 4 o do Grafana). Este módulo tem só dois papéis — comandos (T1) e a Admin API (T3) —, então o T2 fica vazio.
 
@@ -354,7 +354,15 @@ TUDO PRONTO PARA GRAVAR O MODULO 3
 >
 > O preparo **não faz cadastro nenhum** — o cadastro é desta tomada. Se o rótulo `notifications-function` ainda não existir no Loki (a função não subiu nas últimas 24 h), ele sai **ATENÇÃO sem contar checagem** e a tomada continua válida: o cadastro dela gera a linha ao vivo.
 
-**Na tela, deixe pronto:** **três terminais** — **T1** (comandos e cadastro), **T2** (`kubectl get ... -w`) e **T3** (o `port-forward` do Grafana, ocupado até o fim do módulo) — mais o **navegador** com a aba do Grafana em `http://localhost:13000` pronta (o login `admin` é feito na própria tomada, no formulário que mascara a senha). T1 e T2 com `$env:FCG_DEMO_SENHA` (só o T1 usa) e as telas limpas.
+**Na tela, deixe pronto — nesta ordem, porque o preparo exige a porta 13000 livre:**
+
+1. **T1 — o terminal em que você digita**: o diretório de sessão, as checagens do `0/0`, o cadastro, a conferência final e a limpeza. É o **único** que precisa de `$env:FCG_DEMO_SENHA` (o corpo do cadastro é montado nele).
+2. **O preparo, ainda no T1**: rode `-Modulo 3` **antes** de subir o `port-forward` — ele confere, entre outras coisas, que a porta **13000 está livre**, porque o `port-forward` é desta tomada.
+3. **T3** — `kubectl port-forward -n default svc/grafana 13000:3000`: fica **ocupado até o fim do módulo** (não devolve o prompt) e é o túnel que o navegador usa. Não digite mais nada aqui.
+4. **Navegador**: a aba `http://localhost:13000` já aberta. O login `admin` é feito **durante** a tomada, no formulário que mascara a senha.
+5. **T2** — `kubectl get -n default pods -l app=notifications-function -w`: rode **antes** do cadastro, para o pod ser visto nascendo (é a imagem que prova a escala a zero). Também não devolve o prompt, e **não** precisa de `$env:FCG_DEMO_SENHA` — definir ali não faz mal, mas nada o usa.
+
+Por fim, `Clear-Host` nos três terminais antes de apertar REC: tela limpa é corte limpo.
 
 ### Passo a passo na tela
 
@@ -528,9 +536,15 @@ Três variações possíveis, todas impressas pelo preparo (as duas últimas sã
 
 > O único caso em que a prova do contador **não** acontece é a compra de verificação devolvendo **`400`/`409`** (re-execução: o usuário já possui aquele jogo): aí o preparo avisa em `ATENCAO`, não conta checagem (a rodada fecha em **14**, sem a linha do contador) e segue — mas o esperado, quando isso aparece, é rodar `-Modulo 4` de novo até o contador aparecer no `/metrics`.
 
-**Na tela, deixe pronto:** **quatro terminais** em `fcg-orchestration` — **T1** (comandos: login e compra), **T2** (o gerador de tráfego), **T3** (`port-forward` do Grafana) e **T4** (`port-forward` do Prometheus) — mais **duas abas**: o Grafana em `http://localhost:13000` (logado) e o Prometheus em `http://localhost:19090/targets`. T1 com `$env:FCG_DEMO_SENHA` e `$env:FCG_DEMO_JOGO` e as telas limpas.
+**Na tela, deixe pronto — nesta ordem, porque o preparo exige as portas 13000 e 19090 livres:**
 
-> Os dois `port-forward` **não podem dividir o mesmo terminal**: cada um bloqueia a janela até o Ctrl+C. T3 e T4 ficam ocupados até o fim do módulo.
+1. **T1 — o terminal em que você digita** (login e compra). Precisa de `$env:FCG_DEMO_SENHA` e de `$env:FCG_DEMO_JOGO` (o id que o preparo imprime).
+2. **O preparo, ainda no T1**: rode `-Modulo 4` **antes** dos `port-forward` — ele confere que as portas **13000 e 19090 estão livres** e imprime o jogo desta tomada (o `port-forward` é da tomada).
+3. **T3 e T4** — os `port-forward` do Grafana (`13000:3000`) e do Prometheus (`19090:9090`): cada um **bloqueia** o próprio terminal, então **não podem dividir a mesma janela**, e ficam ocupados até o fim do módulo.
+4. **Navegador** — duas abas prontas: o Grafana em `http://localhost:13000` (já logado) e o Prometheus em `http://localhost:19090/targets`.
+5. **T2** — o gerador de tráfego (`scripts/demo-trafego.ps1 -Segundos 90`), rodando enquanto você fala do dashboard.
+
+Por fim, `Clear-Host` nos terminais antes de apertar REC.
 
 ### Passo a passo na tela
 
