@@ -44,6 +44,8 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
    Cada `-Modulo N` **valida e prepara só o que aquela tomada precisa** e termina em **`TUDO PRONTO PARA GRAVAR O MODULO N`**. Se sair `PREFLIGHT REPROVADO ... NAO GRAVE ainda`, leia as linhas `[FALHOU]` acima, corrija e rode de novo (o script termina com `exit 1`). Os módulos que fazem login (**2, 4 e 5**) exigem a senha; os módulos 1, 3 e 6 não fazem login e por isso não exigem (no **3** o preparo lê o cluster, mas quem usa a senha é a **tomada**, no cadastro).
 4. **Confira que a tela está limpa** antes de apertar REC: nada de token, senha, `.env`, `kubectl get secret -o yaml` ou conteúdo do ambiente. As [regras de segurança](#regras-de-segurança-de-gravação) valem para **toda** tomada — um descuido em uma delas vira credencial exposta na entrega.
 5. **Grave o módulo** seguindo o *Passo a passo na tela* do capítulo, usando a *Narração sugerida* como fala. Limpe a tela (`Clear-Host`) no começo para o corte ficar limpo.
+
+   > **Cole os comandos linha a linha.** Todos os blocos deste roteiro têm **um comando por linha** — nenhum depende de continuação de linha (aquele acento grave no fim da linha). Se o seu terminal colar um bloco inteiro numa única linha, o PowerShell junta os comandos e devolve `Token '...' inesperado`; nesse caso, cole **uma linha por vez**, dando Enter em cada uma. Isso vale para o terminal do VS Code, o Windows Terminal e o ISE — e é o erro mais fácil de cometer na pressa da gravação.
 6. **Pare a gravação e salve com o nome do módulo** (`modulo-2-gateway.mp4`), para a edição não depender de memória.
 7. **Feche o que a tomada abriu** — os `port-forward` (Ctrl+C) e a higiene do diretório de sessão que o próprio capítulo termina mostrando — e passe para o módulo seguinte. Os módulos seguintes assumem que as portas voltaram a ficar livres (o preparo de cada um checa isso).
 8. **Regrave quantas vezes quiser.** Cada módulo pode ser regravado do zero: rode **o preparo de novo** antes de cada retake, porque é ele que devolve o estado inicial daquela tomada. O caso mais claro é o da **compra**: o preparo garante (criando um jogo novo, se o usuário demo já possuir todos) um **jogo livre** e imprime o id a ser usado — repetir a compra do mesmo jogo devolveria `400` ("já possui este jogo") e o painel de pagamentos não se mexeria na tela.
@@ -208,10 +210,9 @@ curl.exe -i http://localhost:8000/api/jogos
 # 3) Login (rota ANONIMA). A senha entra pela variavel de ambiente e NUNCA aparece.
 #    O bloco vira uma funcao para ser reaproveitado nos passos 4 e nos modulos 4 e 5.
 function Login-FCG {
-    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline `
-        -Value ('{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}')
-    (curl.exe -s -X POST http://localhost:8000/api/auth/login `
-        -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
+    $corpo = '{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}'
+    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline -Value $corpo
+    (curl.exe -s -X POST http://localhost:8000/api/auth/login -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
 }
 $token = Login-FCG
 'token recebido: ' + $token.Length + ' caracteres'      # prova o login SEM mostrar o token
@@ -381,10 +382,8 @@ kubectl get -n default pods -l app=notifications-function -w
 
 ```powershell
 $email = 'video' + (Get-Date -Format 'HHmmss') + '@fcg.com'
-Set-Content -Path (Join-Path $dirDemo 'cadastro.json') -Encoding ascii -NoNewline `
-    -Value ('{"nome":"Espectador Video","email":"' + $email + '","senha":"' + $env:FCG_DEMO_SENHA + '"}')
-curl.exe -s -o NUL -w 'cadastro=%{http_code}\n' -X POST http://localhost:8000/api/usuarios `
-    -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'cadastro.json'))
+Set-Content -Path (Join-Path $dirDemo 'cadastro.json') -Encoding ascii -NoNewline -Value ('{"nome":"Espectador Video","email":"' + $email + '","senha":"' + $env:FCG_DEMO_SENHA + '"}')
+curl.exe -s -o NUL -w 'cadastro=%{http_code}\n' -X POST http://localhost:8000/api/usuarios -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'cadastro.json'))
 'email do cadastro: ' + $email
 ```
 
@@ -566,10 +565,9 @@ New-Item -ItemType Directory -Path $dirDemo -Force | Out-Null
 
 # 5) Login: a mesma funcao do modulo 2 -- esta sessao e nova, entao ela vem junto
 function Login-FCG {
-    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline `
-        -Value ('{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}')
-    (curl.exe -s -X POST http://localhost:8000/api/auth/login `
-        -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
+    $corpo = '{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}'
+    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline -Value $corpo
+    (curl.exe -s -X POST http://localhost:8000/api/auth/login -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
 }
 $token  = Login-FCG
 'token recebido: ' + $token.Length + ' caracteres'
@@ -586,10 +584,8 @@ $p = ($token -split '\.')[1].Replace('-','+').Replace('_','/')
 switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
 $userId = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).Id
 
-Set-Content -Path (Join-Path $dirDemo 'compra.json') -Encoding ascii -NoNewline `
-    -Value ('{"userId":"' + $userId + '","gameId":"' + $gameId + '"}')
-curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos/" + $gameId + "/comprar") `
-    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'compra.json'))
+Set-Content -Path (Join-Path $dirDemo 'compra.json') -Encoding ascii -NoNewline -Value ('{"userId":"' + $userId + '","gameId":"' + $gameId + '"}')
+curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos/" + $gameId + "/comprar") -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'compra.json'))
 ```
 
 → **`compra=202`** (aceita e assíncrona) e, em até ~30 s (scrape de 15 s + processamento), as séries **`Approved`/`Rejected`** do painel *Pagamentos processados por status* subindo. Se vier **`400`**, o jogo já estava na biblioteca do usuário: **pare e rode o preparo do módulo de novo** — ele escolhe (ou cria) um jogo livre novo e imprime a linha `jogo do modulo 4 (compra)` — em vez de gravar uma tomada sem evidência.
@@ -698,20 +694,17 @@ New-Item -ItemType Directory -Path $dirDemo -Force | Out-Null
 
 # A mesma funcao do modulo 2: esta sessao e nova, entao ela vem junto
 function Login-FCG {
-    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline `
-        -Value ('{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}')
-    (curl.exe -s -X POST http://localhost:8000/api/auth/login `
-        -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
+    $corpo = '{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}'
+    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline -Value $corpo
+    (curl.exe -s -X POST http://localhost:8000/api/auth/login -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
 }
 $token = Login-FCG
 'token recebido: ' + $token.Length + ' caracteres'
 # O $gameId e o id impresso pelo preparo desta tomada (a mesma variavel do modulo 4):
 $gameId = $env:FCG_DEMO_JOGO
 
-Set-Content -Path (Join-Path $dirDemo 'avaliacao.json') -Encoding ascii -NoNewline `
-    -Value '{"nota":5,"comentario":"Jogo muito bom","tags":["acao","video"]}'
-curl.exe -s -w 'avaliacao=%{http_code}\n' -X PUT ("http://localhost:8000/api/jogos/" + $gameId + "/avaliacoes") `
-    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'avaliacao.json'))
+Set-Content -Path (Join-Path $dirDemo 'avaliacao.json') -Encoding ascii -NoNewline -Value '{"nota":5,"comentario":"Jogo muito bom","tags":["acao","video"]}'
+curl.exe -s -w 'avaliacao=%{http_code}\n' -X PUT ("http://localhost:8000/api/jogos/" + $gameId + "/avaliacoes") -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'avaliacao.json'))
 
 # A lista e o resumo vem do Mongo (nao ha tabela de avaliacao no SQL Server):
 curl.exe -s -H "Authorization: Bearer $token" ("http://localhost:8000/api/jogos/" + $gameId + "/avaliacoes")
