@@ -41,7 +41,7 @@ Cada requisito da fase, onde ele está implementado e o comando que comprova —
 | **Persistência poliglota (NoSQL)** | `fcg-catalog-api` (`MongoDB.Driver`, `ReviewDocument`, `MongoReviewRepository`) | `PUT`/`GET /api/jogos/{id}/avaliacoes` (ver [Persistência poliglota e cache](#persistência-poliglota-e-cache)) |
 | **Cache distribuído (Redis)** | `fcg-catalog-api` (`CachedGameRepository`, `catalog:games:all`, `catalog:game:{id}`, TTL 60 s) | `kubectl exec deploy/redis -- redis-cli keys 'catalog:*'` e os contadores `cache_hit`/`cache_miss` no `/metrics` |
 | **Instrumentação nos microsserviços** | `prometheus-net` em `users-api`, `catalog-api` e `payments-api` | `kubectl port-forward svc/<api> 8080:80` + `curl.exe localhost:8080/metrics` |
-| **Segredos fora do repositório** | `.gitignore`, `.env.example`, seção [Segredos](#segredos) | `git grep -n -E 'FCG@Password123\|Fcg2024Test!' -- . ':!README.md'` → vazio (o `:!README.md` tira deste arquivo a própria linha de evidência: sem ela, o comando casaria consigo mesmo) |
+| **Segredos fora do repositório** | `.gitignore`, `.env.example`, seção [Segredos](#segredos) | `git grep -n -E -e 'Password=FCG@' -e 'Fcg2024Test!' -e 'fcg-secret-key-2024' -- . ':!README.md'` → vazio (três `-e` em vez de alternância com pipe: dentro de uma tabela Markdown o `\|` é a forma de escapar o caractere, e esse mesmo `\|` é **pipe literal** no regex do `-E` — a prova ficaria vazia mesmo se houvesse vazamento; o `:!README.md` exclui a própria linha de evidência do resultado) |
 
 **Demonstração em vídeo:** *[link do vídeo — entra aqui após a publicação]* — roteiro em [`docs/roteiro-video-fase3.md`](docs/roteiro-video-fase3.md).
 
