@@ -21,3 +21,4 @@ data:
           - targets:
               - users-api:80
               - catalog-api:80
+              - payments-api:80
