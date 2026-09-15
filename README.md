@@ -565,6 +565,29 @@ kubectl apply -f k8s/grafana-configmap.yaml              # só passa a valer no 
 kubectl rollout restart deployment/grafana
 ```
 
+### Logs (Loki)
+
+O enunciado pede a função serverless **acionada e com os seus logs na plataforma centralizada** — e `kubectl logs` não é plataforma: é leitura pontual, de um pod por vez, e **não sobrevive ao pod**. Isso é decisivo aqui porque a função **escala a zero**: o pod que registrou o `[EMAIL ENVIADO]` normalmente já não existe quando alguém vai olhar o log. Por isso esta fase acrescenta o **Loki** (armazenamento e consulta de logs) e o **Promtail** (agente que coleta no nó), com o Loki cadastrado como **datasource do próprio Grafana** — a mesma plataforma das métricas passa a mostrar o log da função, e a evidência da demonstração fica numa tela só.
+
+- **Coleta** (`k8s/promtail-deployment.yaml`): um **DaemonSet** (um pod por nó, com `ServiceAccount` + `ClusterRole`/`ClusterRoleBinding` de leitura de pods, nodes e endpoints) que lê os arquivos de log direto do nó (`/var/log/pods`) e empurra para `http://loki:3100/loki/api/v1/push`. Um filtro `keep` no relabel deixa entrar **apenas a stack FCG** (`notifications-function`, `users-api`, `catalog-api`, `payments-api` e `kong`): o log do cluster inteiro só encheria um volume de 24h sem ajudar na demonstração. Os labels que chegam ao Loki são `app`, `pod` e `namespace` — o `app` vem do label do pod, e é por ele que os painéis filtram.
+- **Armazenamento** (`k8s/loki-deployment.yaml`): Loki **3.4.2** em modo monolítico, `Service` `loki:3100` do tipo `ClusterIP` (sem rota no gateway, como o Prometheus e o Grafana) e **sem PVC de propósito, como o Redis**: o volume é `emptyDir` e a retenção é de **24h** (`limits_config.retention_period`, com o `compactor` ligado para de fato apagar o que vence). O efeito prático: índice e chunks vivem enquanto o pod viver, então **derrubar o pod do Loki apaga o histórico** — aceitável para a demonstração (e coerente com o custo zero da Opção A), mas é o primeiro ajuste a fazer se os logs tiverem de durar mais; um PVC `prometheus-data`-like resolve.
+- **Consulta no Grafana:** o datasource **Loki** (`uid: loki`, provisionado em `k8s/grafana-configmap.yaml`) fica disponível no **Explore** e alimenta o dashboard **FCG - Logs (Loki)** (`k8s/grafana-logs-configmap.yaml`, `uid: fcg-logs`), com dois painéis: um só da função (`{app="notifications-function"}`) e outro das APIs e do gateway (`{app=~"users-api|catalog-api|payments-api|kong"}`), ambos com atualização a cada 5s. O login e o endereço são os mesmos dos outros painéis ([Acessar os painéis](#acessar-os-painéis-port-forward)).
+- **Consulta sem abrir o Grafana:** o Loki expõe a mesma busca por HTTP, e é o caminho mais direto para provar a coleta no terminal:
+
+```powershell
+kubectl port-forward svc/loki 13100:3100   # outro terminal (13100 não colide com 19090/13000)
+# as linhas de log da função — a mesma query do primeiro painel do dashboard:
+curl.exe -s -G http://localhost:13100/loki/api/v1/query_range --data-urlencode 'query={app="notifications-function"}' --data-urlencode 'limit=20'
+```
+
+> **A consulta volta vazia quando não há evento novo — e isso é o comportamento correto.** A função tem `minReplicaCount: 0`: sem `OrderPlacedEvent`/`UserCreated` na fila não existe pod, não existe arquivo de log e não existe linha para o Promtail ler. Faça um [cadastro](#acessar-as-apis) e consulte de novo: é aí que o `[EMAIL ENVIADO]` aparece. O intervalo também importa — os painéis abrem em "últimos 15 minutos", então um log de ontem fora da janela passa a valer 24h de retenção, mas não aparece no painel até você ajustar o período.
+
+> **Por que o manifesto do Promtail tem duas linhas que não são óbvias** (e que, sem elas, a coleta fica silenciosamente vazia): o `HOSTNAME` do container é fixado em `spec.nodeName`, porque é dessa variável que o Promtail tira o próprio hostname e é com esse valor que ele filtra os pods por `spec.nodeName` — deixado no padrão, o hostname seria o **nome do pod** e o filtro procuraria pods de um nó chamado `promtail-xxxxx`, achando nenhum; e há um relabel que monta o `__path__` (`/var/log/pods/*<uid>/<container>/*.log`), porque o alvo sem esse label é descartado com `no path for target` — o Promtail sabe que o pod existe, mas não qual arquivo ler. O `keep` vem antes dos dois, para o filtro da stack FCG valer já na descoberta.
+
+> **Promtail em fim de vida.** O Promtail está **descontinuado (EOL)**: a Grafana Labs o marcou como *deprecated* em **13/02/2025** (entrou em LTS, sem nenhuma funcionalidade nova — só correção crítica e de segurança) e o fim de vida estava previsto para **02/03/2026**, com todo o desenvolvimento novo indo para o **Grafana Alloy**, o sucessor oficial. Aqui ele segue sendo a escolha por ser o par canônico do Loki 3.4.2 em modo monolítico — uma imagem só, sem CRD e sem operador, e a configuração do `scrape_configs` é a mesma dos tutoriais da ferramenta —, mas **migrar para o Alloy é o follow-up natural** (os componentes equivalentes são `discovery.kubernetes` + `loki.source.file` + `loki.write`, e há um utilitário oficial que converte a config do Promtail).
+
+A semântica de reload é a mesma dos outros arquivos do Grafana ([Alterar a provisão do Grafana](#alterar-a-provisão-do-grafana-semântica-de-reload)): o **dashboard** de logs propaga sozinho, porque o provider `file` relê o diretório a cada 30s, mas o **datasource** exige `kubectl rollout restart deployment/grafana` — é o boot que lê `datasource.yml`. Como o dashboard novo vem de um **segundo** ConfigMap e precisa cair no mesmo diretório que o provider lê, o volume `dashboards` do Grafana é **projetado** (`projected`): ele junta `grafana-dashboards` e `grafana-logs-dashboard` numa única montagem. A alternativa óbvia não serve — a API recusa dois volumes no mesmo `mountPath` (`must be unique`) — e um `subPath` por arquivo dentro de uma pasta montada como `readOnly` é justamente o caso em que a criação do ponto de montagem pode falhar; com o volume projetado a junção acontece na **fonte**, e cada JSON continua chegando pelo seu próprio ConfigMap.
+
 ## Persistência poliglota e cache
 
 Esta fase acrescenta dois serviços de dados ao cluster — **MongoDB** para as avaliações dos jogos e **Redis** para o cache de leitura do catálogo — cada um escolhido pelo **formato do dado**, não por substituição: o SQL Server continua sendo a fonte de verdade do catálogo e dos usuários, e nada foi migrado para fora dele. Os dois manifestos (`k8s/mongo-deployment.yaml` e `k8s/redis-deployment.yaml`) ficam na raiz de `k8s/` e entram no mesmo `kubectl apply -f k8s/` do restante do ambiente; os dois Services são `ClusterIP` (`mongo:27017` e `redis:6379`) e não têm rota no gateway.
@@ -739,7 +762,10 @@ fcg-orchestration/
 │   ├── prometheus-deployment.yaml
 │   ├── grafana-configmap.yaml
 │   ├── grafana-dashboards-configmap.yaml
+│   ├── grafana-logs-configmap.yaml   # dashboard "FCG - Logs (Loki)", entra no volume projetado do Grafana
 │   ├── grafana-deployment.yaml
+│   ├── loki-deployment.yaml         # Deployment + ConfigMap (loki.yml) + Service loki:3100
+│   ├── promtail-deployment.yaml     # ServiceAccount + RBAC + ConfigMap + DaemonSet que coleta os logs do nó
 │   ├── keda/
 │   │   └── README.md                 # procedimento do operador do KEDA (a função é implantada pelo Terraform do repo dela)
 │   └── kong/
