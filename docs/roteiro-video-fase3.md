@@ -28,7 +28,7 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 
 2. **A senha da demonstração vive só na variável de ambiente** `FCG_DEMO_SENHA` (o preflight e o gerador de tráfego leem dela; nenhum dos dois tem senha padrão no arquivo). Ela precisa atender à política do cadastro: **8+ caracteres, com ao menos uma letra, um dígito e um caractere especial**.
 3. **Estado inicial esperado:** os 11 pods de infraestrutura/APIs `Running` e `Ready`, o Promtail `Running`, a função de notificações em **0 réplicas** (nenhum pod) e o usuário `demo@fcg.local` já existente, com o catálogo contendo pelo menos **2 jogos** — é o que o preflight deixa pronto.
-4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` definida.
+4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` definida. O **diretório de sessão** que guarda os corpos de requisição nasce no passo 0 do bloco 2 e é apagado no fechamento (bloco 6) — mantenha o T1 do começo ao fim, ou repita o passo 0.
 5. **Navegador preparado:** deixe as abas já posicionadas antes de gravar (o Grafana e o Prometheus só respondem depois que os `port-forward` dos blocos 3 e 4 subirem — deixe-os ativos até o fim, sem reabrir):
    - Grafana — `http://localhost:13000` (login `admin` e a senha do Secret `grafana-admin`);
    - Prometheus — `http://localhost:19090/targets`;
@@ -44,7 +44,7 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 - **Nunca imprimir o token.** Login com `-o NUL`/`-w '%{http_code}'`, e para provar que o token veio, mostre o **tamanho** (`$token.Length`), não o valor.
 - **Nunca `curl.exe http://localhost:8001/`.** Em modo DB-less a Admin API devolve a configuração declarativa inteira — **incluindo o `secret` HMAC do consumer `fcg-client`, com o qual qualquer um forja um token válido**. Use só `/routes` e `/plugins` (que não trazem segredo).
 - **Nunca mostrar o conteúdo do ambiente** (`Get-ChildItem env:`, `kubectl exec ... -- env`, `docker inspect`): `$env:FCG_DEMO_SENHA` apareceria em claro.
-- **Ao terminar**, feche os terminais da gravação (`Clear-History` + fechar a janela): o token e a senha viveram só na memória daquela sessão. O preflight e o gerador de tráfego também não deixam senha para trás: os dois montam o corpo do login num arquivo temporário (é o `-d @arquivo` do curl, que evita o JSON inline perder as aspas) e **apagam o temporário no fim** — nenhuma senha vai para o repositório.
+- **Ao terminar, apague os temporários da sessão** (bloco 6, "higiene da sessão"): `Remove-Item $dirDemo -Recurse -Force` remove o diretório do passo 0 do bloco 2, que é o **único** lugar em que o roteiro grava corpo de requisição — e o corpo do login carrega a senha. Depois feche os terminais da gravação (`Clear-History` + fechar a janela): o token e a senha viveram só na memória daquela sessão. **Os dois scripts de apoio fazem a mesma limpeza**: o `preflight-fase3.ps1` e o `demo-trafego.ps1` montam o corpo do login num diretório temporário próprio (é o `-d @arquivo` do curl, que evita o JSON inline perder as aspas) e **removem o diretório inteiro no fim**, em todos os caminhos de saída (inclusive quando falham). Ou seja: nenhum artefato com senha — nem o do roteiro, nem o dos scripts — sobrevive à gravação.
 
 ## Bloco 1 — 0:00–0:45: Abertura e arquitetura
 
@@ -66,6 +66,12 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 **T1 (raiz de `fcg-orchestration`):**
 
 ```powershell
+# 0) DIRETORIO DE SESSAO: todo corpo de requisicao (o do login carrega a senha) e gravado SO aqui
+#    dentro, e o diretorio inteiro e removido no fechamento (bloco 6). Sem isso sobraria senha em
+#    claro no %TEMP% da maquina de apresentacao.
+$dirDemo = Join-Path $env:TEMP ('fcg-demo-' + (Get-Date -Format 'HHmmss'))
+New-Item -ItemType Directory -Path $dirDemo -Force | Out-Null
+
 # 1) O Service do gateway: LoadBalancer publicando SO a porta 8000
 kubectl get svc kong
 
@@ -79,10 +85,10 @@ curl.exe -i http://localhost:8000/api/jogos
 # 3) Login (rota ANONIMA). A senha entra pela variavel de ambiente e NUNCA aparece.
 #    O bloco vira uma funcao para ser reaproveitado nos blocos 4 e 5 sem redigitar nada.
 function Login-FCG {
-    Set-Content -Path "$env:TEMP\fcg-login.json" -Encoding ascii -NoNewline `
+    Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline `
         -Value ('{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}')
     (curl.exe -s -X POST http://localhost:8000/api/auth/login `
-        -H "Content-Type: application/json" -d "@$env:TEMP\fcg-login.json" | ConvertFrom-Json).token
+        -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'login.json')) | ConvertFrom-Json).token
 }
 $token = Login-FCG
 'token recebido: ' + $token.Length + ' caracteres'      # prova o login SEM mostrar o token
@@ -92,6 +98,8 @@ curl.exe -s -o NUL -w 'com-token=%{http_code}\n' -H "Authorization: Bearer $toke
 ```
 
 **Na tela:** o **`200` do login** (o `ConvertFrom-Json` não imprime o token: só a linha `token recebido: ...`) e **`com-token=200`**.
+
+> O `$dirDemo` do passo 0 é o **único** lugar onde o roteiro grava arquivo, e ele é apagado no fechamento (bloco 6, "higiene da sessão") — se este terminal for novo, repita o passo 0 antes de chamar `Login-FCG` (a função lê `$dirDemo` da sessão).
 
 ```powershell
 # 5) Admin API do Kong: rota /routes e plugin jwt — a prova do roteamento e da autenticacao
@@ -132,10 +140,10 @@ kubectl get pods -l app=notifications-function -w
 
 ```powershell
 $email = 'video' + (Get-Date -Format 'HHmmss') + '@fcg.com'
-Set-Content -Path "$env:TEMP\fcg-cadastro.json" -Encoding ascii -NoNewline `
+Set-Content -Path (Join-Path $dirDemo 'cadastro.json') -Encoding ascii -NoNewline `
     -Value ('{"nome":"Espectador Video","email":"' + $email + '","senha":"' + $env:FCG_DEMO_SENHA + '"}')
 curl.exe -s -o NUL -w 'cadastro=%{http_code}\n' -X POST http://localhost:8000/api/usuarios `
-    -H "Content-Type: application/json" -d "@$env:TEMP\fcg-cadastro.json"
+    -H "Content-Type: application/json" -d ('@' + (Join-Path $dirDemo 'cadastro.json'))
 'email do cadastro: ' + $email
 ```
 
@@ -163,7 +171,7 @@ kubectl get deploy notifications-function
 
 **Na tela:** o `-w` do T2 mostrando o pod **`Terminating`** → nenhum recurso; e de volta o `0/0`. No Grafana, o log **continua lá** — o pod que o escreveu já não existe, e é exatamente para isso que o Loki existe (`kubectl logs` não sobrevive ao pod).
 
-> **A espera de ~15 s pela função não é travamento: ela É a prova da escala a zero.** `kubectl logs` no caminho contrário (mostrar o log pelo terminal) provaria menos: o pod que registrou o `[EMAIL ENVIADO]` já não existe quando alguém vai ler, e o log tem de estar na plataforma centralizada. Narre a espera: "o KEDA consulta a fila a cada 15 s, e é por isso que o pod leva esse tempo para aparecer".
+> **A espera de ~15–30 s pela função não é travamento: ela É a prova da escala a zero.** `kubectl logs` no caminho contrário (mostrar o log pelo terminal) provaria menos: o pod que registrou o `[EMAIL ENVIADO]` já não existe quando alguém vai ler, e o log tem de estar na plataforma centralizada. Narre a espera: "o KEDA consulta a fila a cada 15 s, e é por isso que o pod leva esse tempo para aparecer".
 
 ## Bloco 4 — 5:15–7:30: Observabilidade (Opção A)
 
@@ -195,10 +203,10 @@ $p = ($token -split '\.')[1].Replace('-','+').Replace('_','/')
 switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
 $userId = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).Id
 
-Set-Content -Path "$env:TEMP\fcg-compra.json" -Encoding ascii -NoNewline `
+Set-Content -Path (Join-Path $dirDemo 'compra.json') -Encoding ascii -NoNewline `
     -Value ('{"userId":"' + $userId + '","gameId":"' + $gameId + '"}')
 curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos/" + $gameId + "/comprar") `
-    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d "@$env:TEMP\fcg-compra.json"
+    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'compra.json'))
 ```
 
 **Na tela:** `compra=202` (aceita e assíncrona) e, em até ~30 s (scrape de 15 s + processamento), as séries **`Approved`/`Rejected`** do painel *Pagamentos processados por status* subindo.
@@ -212,10 +220,10 @@ curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos
 ```powershell
 $token = Login-FCG      # se este terminal for novo; senao reaproveite o $token da sessao
                         # o $gameId vem do bloco 4: mantenha o mesmo terminal T1 de ponta a ponta
-Set-Content -Path "$env:TEMP\fcg-avaliacao.json" -Encoding ascii -NoNewline `
+Set-Content -Path (Join-Path $dirDemo 'avaliacao.json') -Encoding ascii -NoNewline `
     -Value '{"nota":5,"comentario":"Jogo muito bom","tags":["acao","video"]}'
 curl.exe -s -w 'avaliacao=%{http_code}\n' -X PUT ("http://localhost:8000/api/jogos/" + $gameId + "/avaliacoes") `
-    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d "@$env:TEMP\fcg-avaliacao.json"
+    -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'avaliacao.json'))
 
 # A lista e o resumo vem do Mongo (nao ha tabela de avaliacao no SQL Server):
 curl.exe -s -H "Authorization: Bearer $token" ("http://localhost:8000/api/jogos/" + $gameId + "/avaliacoes")
@@ -276,7 +284,18 @@ powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1
 
 **Narração final:** "nenhuma credencial é versionada: os manifestos guardam só o **nome** dos Secrets; a configuração do Kong é um **template** com o marcador `${JWT_SECRET}`, renderizado pelo script a partir do que já está no cluster. A função é implantada pelo **Terraform do repositório dela** — e o `terraform plan` com a função em zero devolve `No changes`: o Terraform não briga com o KEDA pelo número de réplicas."
 
-**Encerramento:** pare os `port-forward` (Ctrl+C) e feche as janelas.
+**Higiene da sessão — o último comando do vídeo (mostre na tela):**
+
+```powershell
+# Os corpos de requisicao da sessao (o do login tem a senha em claro) vivem so no diretorio do
+# passo 0 do bloco 2. Apagar o diretorio inteiro e o fecho do ciclo de segredo da gravacao:
+Remove-Item $dirDemo -Recurse -Force
+Test-Path $dirDemo      # False
+```
+
+**Na tela:** `False` — e a narração: "a senha da demonstração viveu só na variável de ambiente da sessão; os arquivos temporários com ela foram apagados agora, e os dois scripts de apoio (`preflight-fase3.ps1` e `demo-trafego.ps1`) fazem exatamente a mesma limpeza no fim".
+
+**Encerramento:** pare os `port-forward` (Ctrl+C), feche os terminais da gravação (`Clear-History` + fechar a janela) e só então feche o navegador.
 
 ## Se estourar o tempo (regra de corte)
 

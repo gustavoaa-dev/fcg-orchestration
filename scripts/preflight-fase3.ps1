@@ -11,26 +11,37 @@
 #       antes de apertar REC
 #   P4  gateway COM token: GET /api/jogos responde 200
 #   P5  Prometheus: o job fcg-apis com 3 alvos up (users-api, catalog-api, payments-api)
-#   P6  Loki: /ready = ready (via proxy do kubectl) e o rotulo app com log recente
+#   P6  Loki: /ready = ready (via proxy do kubectl, com -eq: um Loki que ainda nao esta pronto
+#       responde 503 "ingester not ready: waiting for 15s after being ready" e o -match aprovaria)
+#       e o rotulo app com log recente. O log DA FUNCAO e ATENCAO quando o rotulo ainda nao existe
+#       (o rotulo so nasce depois que a funcao sobe uma vez na retencao de 24h) e Chk de verdade
+#       quando existe: em nenhum dos casos ha [OK] sem verificacao -- ver a nota de contagem abaixo.
 #   P7  Grafana: /api/health ok, datasource Loki + Prometheus e os dashboards fcg-apis/fcg-logs
 #   P8  KEDA: as tres filas notifications-* existem no broker e o ScaledObject esta Ready=True
 #       (sem fila, o KEDA cai em TriggerError e a funcao SIMPLESMENTE NAO SOBE: falha silenciosa)
 #   P9  DADOS DE DEMONSTRACAO: pelo menos 2 jogos no catalogo; se faltar, promove o usuario de
-#       demonstracao a Admin direto no SQL Server (senha do Secret, lida em memoria), refaz o login
-#       e cria os jogos que faltam pelo gateway
+#       demonstracao a Admin direto no SQL Server (a senha NAO vai na linha de comando: o sh -c usa
+#       o $SA_PASSWORD que o pod ja tem no ambiente), refaz o login e cria os jogos que faltam
 #   P10 Redis com as chaves catalog:* e o Mongo respondendo (GET .../avaliacoes = 200)
 #   P10b os comandos que SO aparecem no video sao exercitados aqui: as series dos paineis em
-#       /metrics (proxy do kubectl, sem port-forward), a compra (esperado 202) e o PUT/GET de
-#       avaliacao (upsert: 201 na primeira, 200 na atualizacao)
+#       /metrics (proxy do kubectl, sem port-forward), a compra (so 202 e [OK]: e a compra ACEITA
+#       que move o painel de pagamentos) e o PUT/GET de avaliacao (upsert: 201 na 1a, 200 na 2a)
 #   P11 FUNCAO EM 0 REPLICAS (estado inicial da demo), esperando o cooldown do KEDA se preciso
+#
+# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os dois casos de ATENCAO
+# (log da funcao ainda ausente no Loki e compra recusada por posse) NAO emitem [OK] e NAO incrementam
+# o contador -- por isso o total varia de 47 a 51 conforme o que o cluster devolve (ver o relatorio).
 #
 # Nada de port-forward: o Prometheus e o Loki sao alcancados pelo proxy do kubectl
 # (kubectl get --raw .../services/<svc>:<porta>/proxy/...) e o Grafana por kubectl exec + wget.
+# Namespace: o proxy exige o namespace no caminho, entao os exec/get usam -n $namespace com o mesmo
+# valor ($namespace = 'default') -- as duas metades olham para o mesmo lugar, sempre.
 #
 # SEGREDOS: a senha da demonstracao vem de $env:FCG_DEMO_SENHA (nao ha senha default no arquivo) e
 # os valores de Secret do cluster sao decodificados em memoria. O unico lugar em que uma senha toca
 # o disco e o corpo JSON temporario do login/cadastro, apagado no fim (bloco finally); toda saida
-# passa por San(), que troca os segredos por *** antes de imprimir.
+# passa por San(), que troca os segredos por *** antes de imprimir -- inclusive a forma ESCAPADA da
+# senha do Grafana (a URL do kubectl exec carrega a senha URL-encoded, nao o valor cru).
 #
 # Uso: $env:FCG_DEMO_SENHA = '<senha>'; powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1
 param(
@@ -47,6 +58,10 @@ $ErrorActionPreference = 'Continue'
 $script:falhas = 0
 $script:checagens = 0
 $script:segredos = @()
+# Namespace UNICO do script: o proxy do kubectl exige o namespace no proprio caminho
+# (/api/v1/namespaces/<ns>/services/...), entao os exec/get usam -n $namespace com o MESMO valor --
+# sem isso, metade das checagens olharia para o namespace do contexto e a outra metade para "default".
+$namespace = 'default'
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('fcg-preflight-' + [guid]::NewGuid().ToString('N'))
 
@@ -96,7 +111,7 @@ function Status($url, $method, $bodyArg, $token) {
 # Segredo do cluster decodificado em memoria (nunca um valor escrito no script).
 function SecretValor($nome, $chave) {
     $s = $null
-    try { $s = (kubectl get secret $nome -o json 2>&1 | Out-String | ConvertFrom-Json) } catch { return $null }
+    try { $s = (kubectl get -n $namespace secret $nome -o json 2>&1 | Out-String | ConvertFrom-Json) } catch { return $null }
     if (-not $s -or -not $s.data) { return $null }
     # Acesso por PSObject: o nome da chave tem hifen ("sa-password") e nao pode virar token.
     $prop = $s.data.PSObject.Properties[$chave]
@@ -104,10 +119,10 @@ function SecretValor($nome, $chave) {
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$prop.Value))
 }
 function Pods($seletor) {
-    return @(kubectl get pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
+    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
 }
 function Prontos($seletor) {
-    return @(kubectl get pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\s1/1\s+Running' }).Count
+    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\s1/1\s+Running' }).Count
 }
 function Kraw($caminho) {
     return (San (((kubectl get --raw $caminho 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
@@ -115,7 +130,7 @@ function Kraw($caminho) {
 # O /metrics de uma API alcancado pelo proxy do kubectl (mesma ideia do Prometheus e do Loki:
 # nenhum port-forward no preflight).
 function Metricas($servico) {
-    return (San (((kubectl get --raw ('/api/v1/namespaces/default/services/' + $servico + '/proxy/metrics') 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+    return (San (((kubectl get --raw ('/api/v1/namespaces/' + $namespace + '/services/' + $servico + '/proxy/metrics') 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
 }
 # Le um claim do JWT sem dependencia externa (o payload e base64url). O userId do corpo da compra
 # e o claim Id do token -- o endpoint ignora um "usuarioId" vindo do corpo.
@@ -129,7 +144,7 @@ function Claim($token, $nome) {
 # A API do Grafana e alcancada de DENTRO do pod (wget do proprio container): nao ha port-forward.
 function GrafanaApi($caminho) {
     $url = 'http://admin:' + [uri]::EscapeDataString($script:senhaGrafana) + '@localhost:3000' + $caminho
-    return (San (((kubectl exec deploy/grafana -- wget -qO- $url 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+    return (San (((kubectl exec -n $namespace deploy/grafana -- wget -qO- $url 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
 }
 function Token {
     $b = Body 'login.json' ('{"email":"' + $Email + '","senha":"' + $Senha + '"}')
@@ -158,14 +173,14 @@ try {
 
 Step 'P1 - cluster: pods e PVCs'
 'pods do namespace:'
-kubectl get pods --no-headers 2>&1 | ForEach-Object { '  ' + $_ }
+kubectl get -n $namespace pods --no-headers 2>&1 | ForEach-Object { '  ' + $_ }
 foreach ($app in @('sqlserver', 'rabbitmq', 'mongo', 'redis', 'users-api', 'catalog-api', 'payments-api', 'kong', 'prometheus', 'grafana', 'loki')) {
     Chk ((Prontos ('app=' + $app)) -ge 1) ('pod-' + $app + '-1/1-Running')
 }
 # O promtail e DaemonSet: um pod por no (neste cluster, 1). Sem ele nao ha log no Loki.
 Chk ((Prontos 'app=promtail') -ge 1) 'pod-promtail-1/1-Running'
 'pvc do cluster:'
-$linhasPvc = @(kubectl get pvc --no-headers 2>&1)
+$linhasPvc = @(kubectl get -n $namespace pvc --no-headers 2>&1)
 $linhasPvc | ForEach-Object { '  ' + $_ }
 foreach ($pvc in @('mongo-data', 'sqlserver-data', 'rabbitmq-data', 'prometheus-data')) {
     $l = @($linhasPvc | Where-Object { $_ -match ('^' + [regex]::Escape($pvc) + '\s') })
@@ -208,7 +223,7 @@ Chk ($s200 -eq '200') 'gateway-200-com-token'
 
 Step 'P5 - Prometheus: alvos do job fcg-apis'
 $alvos = $null
-try { $alvos = ((kubectl get --raw '/api/v1/namespaces/default/services/prometheus:9090/proxy/api/v1/targets' 2>&1) | Out-String | ConvertFrom-Json) } catch { $alvos = $null }
+try { $alvos = ((kubectl get --raw ('/api/v1/namespaces/' + $namespace + '/services/prometheus:9090/proxy/api/v1/targets') 2>&1) | Out-String | ConvertFrom-Json) } catch { $alvos = $null }
 if ($alvos) {
     # O Where-Object nao e enfeite: sem ele, um campo ausente na resposta vira @($null), que o
     # PowerShell conta como UM elemento e faria a checagem passar sem ter lido alvo nenhum.
@@ -226,16 +241,18 @@ if ($alvos) {
 }
 
 Step 'P6 - Loki: pronto e com log da stack'
-$ready = (Kraw '/api/v1/namespaces/default/services/loki:3100/proxy/ready').Trim()
+$ready = (Kraw ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/ready')).Trim()
 'loki /ready = ' + $ready + '  (esperado ready)'
-Chk ($ready -match 'ready') 'loki-ready'
+# -eq e nao -match: um Loki AINDA NAO pronto responde 503 com "ingester not ready: waiting for 15s
+# after being ready" -- a palavra "ready" esta no meio da mensagem e o -match aprovaria um Loki fora.
+Chk ($ready -eq 'ready') 'loki-ready'
 # O teste mais simples de "este app tem log no Loki" e a lista de valores do rotulo app: nao depende
 # de janela de tempo e nao cai na armadilha da query instantanea
 # (/loki/api/v1/query recusa log query com "400 log queries are not supported as an instant query type").
 $rotulos = @()
 for ($i = 0; $i -lt 4; $i++) {
     try {
-        $resp = (Kraw '/api/v1/namespaces/default/services/loki:3100/proxy/loki/api/v1/label/app/values')
+        $resp = (Kraw ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/loki/api/v1/label/app/values'))
         $lido = ($resp | ConvertFrom-Json).data
         # @($null) conta como UM elemento no PowerShell: o filtro evita aprovar sem ter lido nada.
         $rotulos = @($lido | Where-Object { $_ -ne $null })
@@ -245,14 +262,19 @@ for ($i = 0; $i -lt 4; $i++) {
 }
 'rotulos app no Loki = ' + $(if ($rotulos.Count -gt 0) { $rotulos -join ', ' } else { '(nenhum)' })
 Chk ($rotulos.Count -ge 1) 'loki-rotulo-app-com-log'
-if ($rotulos -contains 'notifications-function') {
-    Chk $true 'loki-log-da-funcao-de-notificacoes'
+# A checagem do log da FUNCAO e a propria existencia do rotulo -- mas ela NAO pode reprovar a gravacao:
+# o rotulo so existe depois de a funcao subir UMA vez dentro da retencao de 24h do Loki, e quem vai
+# fazer a funcao subir e o proprio video (o cadastro do bloco 3). Por isso, quando o rotulo existe o
+# Chk roda de verdade (1 checagem); quando nao existe, sai ATENCAO e a checagem NAO e contada --
+# nada de [OK] sem verificacao.
+$temLogDaFuncao = ($rotulos -contains 'notifications-function')
+if ($temLogDaFuncao) {
+    Chk $temLogDaFuncao 'loki-log-da-funcao-de-notificacoes'
 } else {
-    # Nao e falha: o rotulo so existe depois de a funcao subir UMA vez dentro da retencao de 24h.
-    # Durante a gravacao o proprio cadastro do bloco serverless gera esse log.
     Write-Output 'ATENCAO: ainda nao ha log de notifications-function no Loki (a funcao nao rodou nas'
     Write-Output 'ATENCAO: ultimas 24h). Faca um cadastro pelo gateway e confira de novo; o bloco'
     Write-Output 'ATENCAO: serverless do video gera esse log ao vivo e o painel do Grafana mostra ele.'
+    Write-Output '(esta situacao NAO entra na contagem de checagens: nao ha o que verificar ainda)'
 }
 
 Step 'P7 - Grafana: saude, datasources e dashboards'
@@ -265,6 +287,9 @@ if (-not $script:senhaGrafana) {
     Chk $false 'grafana-dashboard-fcg-logs'
 } else {
     $script:segredos += $script:senhaGrafana
+    # A URL do Grafana carrega a senha ESCAPADA ([uri]::EscapeDataString): "P@ss!9#x" vira
+    # "P%40ss!9%23x" e nao seria mascarado pelo valor cru. As duas formas entram na lista.
+    $script:segredos += [uri]::EscapeDataString($script:senhaGrafana)
     $health = $null
     try { $health = (GrafanaApi '/api/health' | ConvertFrom-Json) } catch { $health = $null }
     'grafana /api/health = ' + $(if ($health) { 'database=' + $health.database + ' version=' + $health.version } else { '(sem resposta)' })
@@ -283,20 +308,20 @@ if (-not $script:senhaGrafana) {
 }
 
 Step 'P8 - KEDA: filas do broker e ScaledObject'
-$filas = (San (((kubectl exec deploy/rabbitmq -- rabbitmqctl list_queues name 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+$filas = (San (((kubectl exec -n $namespace deploy/rabbitmq -- rabbitmqctl list_queues name 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
 $filas -split "`n" | Where-Object { $_ -match '\S' } | ForEach-Object { '  ' + $_.Trim() }
 foreach ($fila in @('notifications-user-created', 'notifications-payment-processed', 'notifications-dead-letter')) {
     Chk ($filas -match [regex]::Escape($fila)) ('fila-' + $fila)
 }
 $so = $null
-try { $so = (kubectl get scaledobject notifications-function -o json 2>&1 | Out-String | ConvertFrom-Json) } catch { $so = $null }
+try { $so = (kubectl get -n $namespace scaledobject notifications-function -o json 2>&1 | Out-String | ConvertFrom-Json) } catch { $so = $null }
 if ($so) {
     $readySo = ($so.status.conditions | Where-Object { $_.type -eq 'Ready' }).status
     'ScaledObject notifications-function Ready=' + $readySo + '  min=' + $so.spec.minReplicaCount + ' max=' + $so.spec.maxReplicaCount
     Chk ($readySo -eq 'True') 'scaledobject-Ready-True'
     if ($readySo -ne 'True') {
         'TriggerError costuma ser fila ausente no broker: rode o terraform apply do repositorio da funcao.'
-        San (((kubectl describe scaledobject notifications-function 2>&1) | Select-String -Pattern 'Ready|Error|queue' | Select-Object -First 8 | ForEach-Object { '  ' + [string]$_ }) -join "`n")
+        San (((kubectl describe -n $namespace scaledobject notifications-function 2>&1) | Select-String -Pattern 'Ready|Error|queue' | Select-Object -First 8 | ForEach-Object { '  ' + [string]$_ }) -join "`n")
     }
 } else {
     'ScaledObject notifications-function nao encontrado: a funcao nao esta implantada (terraform apply do repo dela)'
@@ -311,16 +336,23 @@ Chk ($lista.Code -eq '200') 'catalogo-listagem-200'
 if ($jogos.Count -lt $JogosMinimos) {
     Write-Output '*** AVISO: faltam jogos para a demonstracao (o dado do SQL Server e volatil enquanto o ***'
     Write-Output '*** AVISO: PVC nao entrar: qualquer restart de container esvazia o banco). Criando agora. ***'
-    # O POST /api/jogos exige Admin e a users-api registra todos como Usuario: promocao direta no SQL
-    # (a senha do sa vem do Secret, decodificada em memoria).
+    # O POST /api/jogos exige Admin e a users-api registra todos como Usuario: promocao direta no SQL.
+    # A senha do sa NAO vai na linha de comando: o pod do sqlserver ja tem SA_PASSWORD no ambiente
+    # (secretKeyRef do sqlserver-secret, em k8s/sqlserver-deployment.yaml) e o sh -c a expande DENTRO
+    # do container. Assim ela nao aparece em "kubectl ... -P <senha>" (argv visivel em ps/audit log).
     $sa = SecretValor 'sqlserver-secret' 'sa-password'
+    # O Secret ainda e lido em memoria: se ele nao existir, o container tambem esta sem SA_PASSWORD e o
+    # sqlcmd falharia de um jeito confuso -- melhor reprovar aqui, com a causa.
+    Chk ([bool]$sa) 'secret-sqlserver-sa-password-presente'
     if (-not $sa) {
         'NAO consegui ler o Secret sqlserver-secret/sa-password: o POST de jogo vai responder 403.'
     } else {
         $script:segredos += $sa
         $sql = "UPDATE FCG_Users.dbo.Users SET Role = 1 WHERE Email = '" + $Email + "'"
-        $saidaSql = (San (((kubectl exec deploy/sqlserver -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $sa -C -Q $sql 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
-        'promocao do usuario de demonstracao a Admin (sqlcmd): ' + $(if ($saidaSql) { $saidaSql } else { '(sem saida)' })
+        $cmdSql = '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -Q "' + $sql + '"'
+        $saidaSql = (San (((kubectl exec -n $namespace deploy/sqlserver -- sh -c $cmdSql 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
+        'promocao do usuario de demonstracao a Admin (sqlcmd dentro do pod, com $SA_PASSWORD do ambiente):'
+        $(if ($saidaSql) { '  ' + $saidaSql } else { '  (sem saida)' })
         $token = Token
         Chk ([bool]$token) 'login-apos-promocao-a-Admin'
     }
@@ -342,13 +374,13 @@ if ($jogos.Count -ge 1) { $jogoId = $jogos[0].id }
 Step 'P10 - Redis (cache) e MongoDB (avaliacoes)'
 # O TTL da chave e de 60s: a listagem e lida IMEDIATAMENTE antes de olhar o Redis.
 $sLista = Status ($Gateway + '/api/jogos') 'GET' $null $token
-$chaves = (San (((kubectl exec deploy/redis -- redis-cli keys 'catalog:*' 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+$chaves = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli keys 'catalog:*' 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
 'GET /api/jogos (aquece o cache) = ' + $sLista
 'redis-cli keys catalog:* = ' + $(if ($chaves) { $chaves } else { '(vazio)' })
 Chk ($chaves -match 'catalog:') 'redis-com-chaves-catalog'
 if ($jogoId) {
-    $tipo = (San (((kubectl exec deploy/redis -- redis-cli type catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
-    $ttl = (San (((kubectl exec deploy/redis -- redis-cli ttl catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+    $tipo = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli type catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+    $ttl = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli ttl catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
     'redis-cli type/ttl catalog:games:all = ' + $tipo + ' / ' + $ttl + '  (esperado hash / ate 60)'
     $mongo = Resposta ($Gateway + '/api/jogos/' + $jogoId + '/avaliacoes') 'GET' $null $token
     'GET /api/jogos/{id}/avaliacoes = ' + $mongo.Code + '  (esperado 200: e o caminho do Mongo)'
@@ -380,17 +412,22 @@ if ($userId -and $jogoCompra) {
     $rCompra = Resposta ($Gateway + '/api/jogos/' + $jogoCompra + '/comprar') 'POST' $bCompra $token
     'POST /api/jogos/{id}/comprar = ' + $rCompra.Code + '  (esperado 202)  jogo=' + $jogoCompra
     '  corpo = ' + $rCompra.Texto
-    # 202 = compra aceita (o video e a serie que se move no painel de pagamentos). 400/409 costumam
-    # ser "o usuario de demonstracao ja possui este jogo", de uma rodada anterior: nao impede gravar.
-    Chk (@('202', '400', '409') -contains $rCompra.Code) 'compra-respondida-sem-erro'
-    if ($rCompra.Code -ne '202') {
-        'ATENCAO: a compra nao devolveu 202 -- o painel "Pagamentos processados por status" so se move'
-        'ATENCAO: com uma compra ACEITA. Se o corpo acima falar de posse/jogo, crie um jogo novo antes'
-        'ATENCAO: de gravar o bloco 4.'
+    # SO 202 e [OK]: e a compra ACEITA que publica OrderPlacedEvent e move o painel "Pagamentos
+    # processados por status" do bloco 4. 400/409 costumam ser "o usuario de demonstracao ja possui
+    # este jogo" (rodada anterior do preflight): nao impede gravar, mas entao NAO houve verificacao da
+    # compra -- sai ATENCAO e a checagem NAO e contada (nada de [OK] sem verificacao).
+    $compraAceita = ($rCompra.Code -eq '202')
+    if ($compraAceita) {
+        Chk $compraAceita 'compra-aceita-202'
+    } else {
+        Write-Output ('ATENCAO: a compra devolveu ' + $rCompra.Code + ' em vez de 202 -- o painel de pagamentos')
+        Write-Output 'ATENCAO: so se move com uma compra ACEITA. Se o corpo acima falar de posse/jogo, crie'
+        Write-Output 'ATENCAO: um jogo novo antes de gravar o bloco 4.'
+        Write-Output '(esta situacao NAO entra na contagem de checagens: a compra nao foi aceita)'
     }
 } else {
     'sem userId no token ou sem jogo: a compra do bloco 4 do video nao pode ser exercitada'
-    Chk $false 'compra-respondida-sem-erro'
+    Chk $false 'compra-aceita-202'
 }
 if ($jogoId) {
     # O PUT e upsert por (gameId, userId): 201 na primeira avaliacao e 200 ao atualizar.
@@ -417,13 +454,13 @@ if ($token) {
     $zero = $false
     while (((Get-Date) - $t0).TotalSeconds -lt $EsperaCooldown) {
         $podsFn = @(Pods 'app=notifications-function')
-        $repFn = ((kubectl get deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
+        $repFn = ((kubectl get -n $namespace deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
         if (($podsFn.Count -eq 0) -and ($repFn -eq '0')) { $zero = $true; break }
         '  aguardando o cooldown do KEDA (30s) + o termino do pod... pods=' + $podsFn.Count + ' replicas=' + $repFn
         Start-Sleep -Seconds 10
     }
     $podsFn = @(Pods 'app=notifications-function')
-    $repFn = ((kubectl get deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
+    $repFn = ((kubectl get -n $namespace deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
     'deployment notifications-function: replicas=' + $repFn + '  pods=' + $podsFn.Count + '  (esperado 0 e 0)'
     'kubectl get pods -l app=notifications-function = ' + $(if ($podsFn.Count -eq 0) { 'No resources found' } else { ($podsFn -join ' | ') })
     Chk $zero 'funcao-em-zero-replicas-estado-inicial'
