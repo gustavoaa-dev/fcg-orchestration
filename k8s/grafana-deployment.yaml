@@ -51,6 +51,8 @@ spec:
             - name: provisioning
               mountPath: /etc/grafana/provisioning
               readOnly: true
+            # O volume e projetado e junta os dois ConfigMaps de dashboard neste diretorio (o
+            # provider le a pasta inteira, entao o fcg-logs.json fica ao lado do fcg-apis.json)
             - name: dashboards
               mountPath: /var/lib/grafana/dashboards
               readOnly: true
@@ -65,9 +67,16 @@ spec:
                 path: datasources/datasource.yml
               - key: dashboards.yml
                 path: dashboards/dashboards.yml
+        # Dois ConfigMaps no MESMO diretorio: nao da para montar dois volumes no mesmo
+        # mountPath (a API recusa com "must be unique") e um subPath dentro de um mount
+        # readOnly nao e confiavel, entao a juncao e feita na fonte, com volume projetado
         - name: dashboards
-          configMap:
-            name: grafana-dashboards
+          projected:
+            sources:
+              - configMap:
+                  name: grafana-dashboards
+              - configMap:
+                  name: grafana-logs-dashboard
         - name: data
           emptyDir: {}
 ---

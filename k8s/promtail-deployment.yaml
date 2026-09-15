@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  labels:
+    app: promtail
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: promtail
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: promtail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: promtail
+subjects:
+  - kind: ServiceAccount
+    name: promtail
+    namespace: default
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  labels:
+    app: promtail
+data:
+  promtail.yml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /run/promtail/positions.yaml
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: fcg-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # so a stack FCG entra no Loki (o volume de log do cluster inteiro nao ajuda a demo)
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            regex: "notifications-function|users-api|catalog-api|payments-api|kong"
+            action: keep
+          # obrigatorio: e por este label que o promtail confere se o pod roda no MESMO no
+          # que ele (um DaemonSet nao pode ler o arquivo de log de outro no)
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: __host__
+          # obrigatorio: sem __path__ o alvo e descartado ("no path for target") por nao
+          # dizer QUAL arquivo ler. No no, o layout e
+          # /var/log/pods/<namespace>_<pod>_<uid>/<container>/<n>.log
+          - action: replace
+            source_labels: [__meta_kubernetes_pod_uid, __meta_kubernetes_pod_container_name]
+            separator: /
+            target_label: __path__
+            replacement: "/var/log/pods/*$1/*.log"
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: app
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  labels:
+    app: promtail
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.4.2
+          imagePullPolicy: IfNotPresent
+          args: ["-config.file=/etc/promtail/promtail.yml"]
+          # O promtail tira o proprio hostname desta variavel e usa esse valor para filtrar
+          # os pods por spec.nodeName. Sem ela o hostname seria o nome do POD (o hostname do
+          # container), o filtro nao acharia pod nenhum e o promtail nao coletaria nada.
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promtail
+            - name: run
+              mountPath: /run/promtail
+            - name: pods
+              mountPath: /var/log/pods
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: promtail-config
+        # DirectoryOrCreate: guarda o positions.yaml (o "bookmark" de ate onde cada arquivo
+        # ja foi lido) e garante a pasta no no, que nao existe por padrao
+        - name: run
+          hostPath:
+            path: /run/promtail
+            type: DirectoryOrCreate
+        - name: pods
+          hostPath:
+            path: /var/log/pods
