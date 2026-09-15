@@ -19,18 +19,25 @@
 #   P7  Grafana: /api/health ok, datasource Loki + Prometheus e os dashboards fcg-apis/fcg-logs
 #   P8  KEDA: as tres filas notifications-* existem no broker e o ScaledObject esta Ready=True
 #       (sem fila, o KEDA cai em TriggerError e a funcao SIMPLESMENTE NAO SOBE: falha silenciosa)
-#   P9  DADOS DE DEMONSTRACAO: pelo menos 2 jogos no catalogo; se faltar, promove o usuario de
-#       demonstracao a Admin direto no SQL Server (a senha NAO vai na linha de comando: o sh -c usa
-#       o $SA_PASSWORD que o pod ja tem no ambiente), refaz o login e cria os jogos que faltam
+#   P9  DADOS DE DEMONSTRACAO: pelo menos 3 jogos no catalogo; se faltar, promove o usuario de
+#       demonstracao a Admin direto no SQL Server (o SQL vai por STDIN para /tmp do pod e o sqlcmd le
+#       com -i -- NENHUMA aspas interna no kubectl exec, que o Windows nao preserva; a senha vem do
+#       $SA_PASSWORD do ambiente do container), refaz o login e cria os jogos que faltam. Depois le a
+#       biblioteca do usuario (GET /api/biblioteca/{userId}) e escolhe o JOGO DO BLOCO 4: o primeiro
+#       do catalogo que o usuario ainda NAO possui (o catalogo volta ordenado por nome e a biblioteca
+#       cresce a cada rodada -- "o primeiro id do catalogo" daria 400 na compra do video)
 #   P10 Redis com as chaves catalog:* e o Mongo respondendo (GET .../avaliacoes = 200)
 #   P10b os comandos que SO aparecem no video sao exercitados aqui: as series dos paineis em
 #       /metrics (proxy do kubectl, sem port-forward), a compra (so 202 e [OK]: e a compra ACEITA
-#       que move o painel de pagamentos) e o PUT/GET de avaliacao (upsert: 201 na 1a, 200 na 2a)
+#       que move o painel de pagamentos -- e ela usa OUTRO jogo, para nao consumir o do bloco 4) e o
+#       PUT/GET de avaliacao (upsert: 201 na 1a, 200 na 2a) no jogo do bloco 4
 #   P11 FUNCAO EM 0 REPLICAS (estado inicial da demo), esperando o cooldown do KEDA se preciso
 #
-# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os dois casos de ATENCAO
-# (log da funcao ainda ausente no Loki e compra recusada por posse) NAO emitem [OK] e NAO incrementam
-# o contador -- por isso o total varia de 47 a 51 conforme o que o cluster devolve (ver o relatorio).
+# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os tres casos de ATENCAO
+# (log da funcao ainda ausente no Loki, compra recusada por posse e biblioteca que nao respondeu 200)
+# NAO emitem [OK] e NAO incrementam o contador -- por isso o total varia de 48 a 53 conforme o que o
+# cluster devolve: 51 no caminho ideal, +2 se o preflight precisar promover o usuario a Admin, e -1
+# por cada ATENCAO (ver a tabela de cenarios no relatorio).
 #
 # Nada de port-forward: o Prometheus e o Loki sao alcancados pelo proxy do kubectl
 # (kubectl get --raw .../services/<svc>:<porta>/proxy/...) e o Grafana por kubectl exec + wget.
@@ -50,7 +57,7 @@ param(
     [string]$Nome = 'Jogador Demo',
     # SEM default: a senha da demonstracao NAO pode ficar versionada (regra global de segredos).
     [string]$Senha = $env:FCG_DEMO_SENHA,
-    [int]$JogosMinimos = 2,
+    [int]$JogosMinimos = 3,
     [int]$EsperaCooldown = 180
 )
 
@@ -118,8 +125,18 @@ function SecretValor($nome, $chave) {
     if (-not $prop) { return $null }
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$prop.Value))
 }
-function Pods($seletor) {
-    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
+# Promove o usuario de demonstracao a Admin direto no SQL Server (o POST /api/jogos exige Admin).
+# O SQL vai por STDIN para /tmp DENTRO do pod e o sqlcmd le com -i: nenhuma aspas interna no
+# kubectl exec (o Windows nao as preserva -- ver a nota no P9) e a senha vem do $SA_PASSWORD que o
+# pod ja tem no ambiente. Devolve a saida do sqlcmd (para o chamador imprimir).
+function PromoverDemoAdmin($email) {
+    $sql = "UPDATE FCG_Users.dbo.Users SET Role = 1 WHERE Email = '" + $email + "'"
+    $sql | kubectl exec -i -n $namespace deploy/sqlserver -- sh -c 'cat > /tmp/promover.sql' 2>&1 | Out-Null
+    $saida = (San (((kubectl exec -n $namespace deploy/sqlserver -- sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD -C -i /tmp/promover.sql' 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
+    kubectl exec -n $namespace deploy/sqlserver -- sh -c 'rm -f /tmp/promover.sql' 2>&1 | Out-Null
+    return $saida
+}
+function Pods($seletor) {    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
 }
 function Prontos($seletor) {
     return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\s1/1\s+Running' }).Count
@@ -140,6 +157,26 @@ function Claim($token, $nome) {
     $p = $p.Replace('-', '+').Replace('_', '/')
     switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
     try { return (([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).$nome) } catch { return $null }
+}
+# Ids dos jogos que o usuario tem na biblioteca: a resposta pode ser a lista direta ou vir dentro de
+# um envelope ({ "itens": [...] } / { "jogos": [...] }), e cada item pode trazer o id em "id",
+# "jogoId" ou "jogo.id". A comparacao com o catalogo e feita em minusculas (Guid nao tem caixa fixa).
+function IdsDaBiblioteca($corpo) {
+    if (-not $corpo) { return @() }
+    $lista = $corpo
+    foreach ($prop in @('itens', 'jogos', 'biblioteca', 'items')) {
+        $p = $corpo.PSObject.Properties[$prop]
+        if ($p -and $p.Value) { $lista = $p.Value; break }
+    }
+    $ids = @()
+    foreach ($item in @($lista | Where-Object { $_ -ne $null })) {
+        $id = $null
+        if ($item.id) { $id = $item.id }
+        elseif ($item.jogoId) { $id = $item.jogoId }
+        elseif ($item.jogo -and $item.jogo.id) { $id = $item.jogo.id }
+        if ($id) { $ids += [string]$id }
+    }
+    return $ids
 }
 # A API do Grafana e alcancada de DENTRO do pod (wget do proprio container): nao ha port-forward.
 function GrafanaApi($caminho) {
@@ -328,7 +365,7 @@ if ($so) {
     Chk $false 'scaledobject-Ready-True'
 }
 
-Step 'P9 - dados de demonstracao: jogos no catalogo'
+Step 'P9 - dados de demonstracao: jogos no catalogo e o jogo do bloco 4'
 $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
 $jogos = @($lista.Body | Where-Object { $_ -ne $null })
 'GET /api/jogos = ' + $lista.Code + '  jogos no catalogo = ' + $jogos.Count + '  (minimo ' + $JogosMinimos + ')'
@@ -337,9 +374,12 @@ if ($jogos.Count -lt $JogosMinimos) {
     Write-Output '*** AVISO: faltam jogos para a demonstracao (o dado do SQL Server e volatil enquanto o ***'
     Write-Output '*** AVISO: PVC nao entrar: qualquer restart de container esvazia o banco). Criando agora. ***'
     # O POST /api/jogos exige Admin e a users-api registra todos como Usuario: promocao direta no SQL.
-    # A senha do sa NAO vai na linha de comando: o pod do sqlserver ja tem SA_PASSWORD no ambiente
-    # (secretKeyRef do sqlserver-secret, em k8s/sqlserver-deployment.yaml) e o sh -c a expande DENTRO
-    # do container. Assim ela nao aparece em "kubectl ... -P <senha>" (argv visivel em ps/audit log).
+    # A promocao usa PromoverDemoAdmin(): o SQL vai por STDIN -> /tmp/promover.sql -> "sqlcmd -i" ->
+    # "rm -f". A forma antiga (a query entre aspas dentro do argumento do shell, com -Q) NAO funciona
+    # no Windows: as aspas internas se perdem na passagem de argumentos e o sqlcmd responde
+    # "Msg 102, Level 15, State 1 ... Incorrect syntax near 'SELECT'" -- medido no cluster.
+    # A senha do sa nao entra em argv nenhum: o shell do container expande o $SA_PASSWORD que o pod ja
+    # tem no ambiente (secretKeyRef do sqlserver-secret, em k8s/sqlserver-deployment.yaml).
     $sa = SecretValor 'sqlserver-secret' 'sa-password'
     # O Secret ainda e lido em memoria: se ele nao existir, o container tambem esta sem SA_PASSWORD e o
     # sqlcmd falharia de um jeito confuso -- melhor reprovar aqui, com a causa.
@@ -348,28 +388,97 @@ if ($jogos.Count -lt $JogosMinimos) {
         'NAO consegui ler o Secret sqlserver-secret/sa-password: o POST de jogo vai responder 403.'
     } else {
         $script:segredos += $sa
-        $sql = "UPDATE FCG_Users.dbo.Users SET Role = 1 WHERE Email = '" + $Email + "'"
-        $cmdSql = '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -Q "' + $sql + '"'
-        $saidaSql = (San (((kubectl exec -n $namespace deploy/sqlserver -- sh -c $cmdSql 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
-        'promocao do usuario de demonstracao a Admin (sqlcmd dentro do pod, com $SA_PASSWORD do ambiente):'
+        $saidaSql = PromoverDemoAdmin $Email
+        'promocao do usuario de demonstracao a Admin (sqlcmd -i dentro do pod, com $SA_PASSWORD do ambiente):'
         $(if ($saidaSql) { '  ' + $saidaSql } else { '  (sem saida)' })
         $token = Token
         Chk ([bool]$token) 'login-apos-promocao-a-Admin'
     }
-    for ($i = $jogos.Count; $i -lt $JogosMinimos; $i++) {
-        $bJogo = Body ('jogo-' + ($i + 1) + '.json') ('{"nome":"Jogo Demo ' + ($i + 1) + '","descricao":"Jogo de demonstracao da Fase 3","preco":' + (49 + $i) + '.90}')
+    # Cria jogos ate o minimo, re-listando a cada criacao (o POST devolve 201 e o catalogo cresce).
+    $tentativaJogo = 0
+    while (($jogos.Count -lt $JogosMinimos) -and ($tentativaJogo -lt 6)) {
+        $tentativaJogo++
+        $nomeJogo = 'Jogo Demo ' + $tentativaJogo
+        $bJogo = Body ('jogo-' + $tentativaJogo + '.json') ('{"nome":"' + $nomeJogo + '","descricao":"Jogo de demonstracao da Fase 3","preco":' + (49 + $tentativaJogo) + '.90}')
         $rJogo = Resposta ($Gateway + '/api/jogos') 'POST' $bJogo $token
-        'POST /api/jogos = ' + $rJogo.Code + '  (esperado 201)  nome=Jogo Demo ' + ($i + 1)
+        'POST /api/jogos = ' + $rJogo.Code + '  (esperado 201)  nome=' + $nomeJogo
         if ($rJogo.Code -ne '201') { break }
+        $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
+        $jogos = @($lista.Body | Where-Object { $_ -ne $null })
     }
-    $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
-    $jogos = @($lista.Body | Where-Object { $_ -ne $null })
     'jogos no catalogo apos a criacao = ' + $jogos.Count
 }
 Chk ($jogos.Count -ge $JogosMinimos) 'catalogo-com-jogos-para-a-demo'
-$jogoId = $null
-if ($jogos.Count -ge 1) { $jogoId = $jogos[0].id }
-'primeiro jogo (usado nos blocos NoSQL/compra do video) = ' + $jogoId
+
+# O BLOCO 4 DO VIDEO COMPRA UM JOGO -- e so a PRIMEIRA compra daquele par (usuario, jogo) devolve 202 e
+# move o painel de pagamentos. O catalogo do cluster volta ORDENADO POR NOME (nao por criacao) e a
+# biblioteca do usuario de demonstracao cresce a cada rodada, entao "o primeiro id do catalogo" nao
+# serve: o jogo tem de ser o primeiro que o usuario AINDA NAO possui. A escolha e impressa no
+# RESULTADO para o roteiro usar exatamente ela.
+$userId = Claim $token 'Id'
+'userId (claim Id do token) = ' + $userId
+$bib = Resposta ($Gateway + '/api/biblioteca/' + $userId) 'GET' $null $token
+'GET /api/biblioteca/{userId} = ' + $bib.Code + '  (a biblioteca do usuario demo)'
+$idsBiblioteca = @()
+# Mesma politica do rotulo do Loki: o predicado vai para o Chk (nunca uma constante -- o [OK] tem de
+# vir da verificacao, nao de uma constante). Sem 200, sai ATENCAO e a checagem NAO e contada.
+$bibliotecaLida = ($bib.Code -eq '200')
+if ($bibliotecaLida) {
+    Chk $bibliotecaLida 'biblioteca-do-usuario-200'
+    $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
+    'biblioteca do usuario demo = ' + $idsBiblioteca.Count + ' jogo(s): ' + $(if ($idsBiblioteca.Count -gt 0) { $idsBiblioteca -join ', ' } else { '(vazia)' })
+} else {
+    # Nao reprova (a escolha abaixo continua valida), mas sem a biblioteca a escolha pode cair em um
+    # jogo que o usuario ja possui -- entao isto NAO vira [OK] e NAO entra na contagem de checagens.
+    Write-Output ('ATENCAO: GET /api/biblioteca/{userId} respondeu ' + $bib.Code + ' -- nao consegui ler a')
+    Write-Output 'ATENCAO: biblioteca do usuario demo. A escolha abaixo cai no PRIMEIRO jogo do catalogo,'
+    Write-Output 'ATENCAO: que pode ja ser dele (compra 400 no bloco 4). Confira depois de gravar.'
+    Write-Output '(esta situacao NAO entra na contagem de checagens: a biblioteca nao foi lida)'
+}
+$jogoDemo = $null
+$jogoDemoNome = ''
+$tentativaLivre = 0
+while ((-not $jogoDemo) -and ($tentativaLivre -lt 3)) {
+    $tentativaLivre++
+    for ($i = 0; $i -lt $jogos.Count; $i++) {
+        $idCand = [string]$jogos[$i].id
+        if ($idCand -and ($idsBiblioteca -notcontains $idCand.ToLower())) {
+            $jogoDemo = $idCand
+            $jogoDemoNome = [string]$jogos[$i].nome
+            break
+        }
+    }
+    if (-not $jogoDemo) {
+        # Todos os jogos do catalogo ja estao na biblioteca: cria mais um e recalcula. O POST exige
+        # Admin -- se este preflight ainda nao promoveu o usuario (o catalogo ja tinha 3 jogos, entao o
+        # caminho da promocao nao rodou), promove agora e tenta de novo: sem isso a gravacao ficaria
+        # sem nenhum jogo livre para o bloco 4.
+        'todos os jogos do catalogo ja estao na biblioteca do usuario demo: criando mais um'
+        $nomeExtra = 'Jogo Demo Livre ' + $tentativaLivre
+        $bExtra = Body ('jogo-extra-' + $tentativaLivre + '.json') ('{"nome":"' + $nomeExtra + '","descricao":"Jogo livre para a compra do video","preco":89.90}')
+        $rExtra = Resposta ($Gateway + '/api/jogos') 'POST' $bExtra $token
+        'POST /api/jogos = ' + $rExtra.Code + '  (esperado 201)  nome=' + $nomeExtra
+        if ($rExtra.Code -ne '201') {
+            $saExtra = SecretValor 'sqlserver-secret' 'sa-password'
+            if ($saExtra) {
+                $script:segredos += $saExtra
+                'POST recusado (' + $rExtra.Code + '): promovendo o usuario demo a Admin e tentando de novo'
+                $saidaExtra = PromoverDemoAdmin $Email
+                $(if ($saidaExtra) { '  ' + $saidaExtra } else { '  (sem saida)' })
+                $token = Token
+                $rExtra = Resposta ($Gateway + '/api/jogos') 'POST' $bExtra $token
+                'POST /api/jogos (apos a promocao) = ' + $rExtra.Code + '  (esperado 201)'
+            } else {
+                'NAO consegui ler o Secret sqlserver-secret/sa-password: nao ha como promover o usuario'
+            }
+            if ($rExtra.Code -ne '201') { break }
+        }
+        $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
+        $jogos = @($lista.Body | Where-Object { $_ -ne $null })
+    }
+}
+'jogo do bloco 4 (compra) = ' + $jogoDemoNome + ' (' + $jogoDemo + ')'
+Chk ([bool]$jogoDemo) 'jogo-do-bloco-4-escolhido'
 
 Step 'P10 - Redis (cache) e MongoDB (avaliacoes)'
 # O TTL da chave e de 60s: a listagem e lida IMEDIATAMENTE antes de olhar o Redis.
@@ -378,15 +487,15 @@ $chaves = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli keys 'cat
 'GET /api/jogos (aquece o cache) = ' + $sLista
 'redis-cli keys catalog:* = ' + $(if ($chaves) { $chaves } else { '(vazio)' })
 Chk ($chaves -match 'catalog:') 'redis-com-chaves-catalog'
-if ($jogoId) {
+if ($jogoDemo) {
     $tipo = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli type catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
     $ttl = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli ttl catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
     'redis-cli type/ttl catalog:games:all = ' + $tipo + ' / ' + $ttl + '  (esperado hash / ate 60)'
-    $mongo = Resposta ($Gateway + '/api/jogos/' + $jogoId + '/avaliacoes') 'GET' $null $token
+    $mongo = Resposta ($Gateway + '/api/jogos/' + $jogoDemo + '/avaliacoes') 'GET' $null $token
     'GET /api/jogos/{id}/avaliacoes = ' + $mongo.Code + '  (esperado 200: e o caminho do Mongo)'
     Chk ($mongo.Code -eq '200') 'mongo-avaliacoes-200'
 } else {
-    'sem jogo no catalogo: a checagem do Mongo nao pode rodar'
+    'sem jogo escolhido: a checagem do Mongo nao pode rodar'
     Chk $false 'mongo-avaliacoes-200'
 }
 
@@ -400,17 +509,19 @@ Chk ($mCatalog -match 'http_requests_received_total') 'metrics-catalog-api-http-
 Chk ($mCatalog -match '(?m)^cache_hit') 'metrics-catalog-api-cache-hit'
 Chk ($mCatalog -match '(?m)^cache_miss') 'metrics-catalog-api-cache-miss'
 Chk ($mPayments -match '(?m)^fcg_payments_processados_total') 'metrics-payments-api-contador-de-negocio'
-$userId = Claim $token 'Id'
-'userId (claim Id do token, usado na compra) = ' + $userId
-# A compra do preflight usa o ULTIMO jogo do catalogo DE PROPOSITO: o video compra o PRIMEIRO (bloco
-# 4), e e a PRIMEIRA compra daquele par (usuario, jogo) que devolve 202 e move o painel de
-# pagamentos. Comprando o primeiro aqui, o video poderia receber 400/409 ("ja possui este jogo").
-$jogoCompra = $jogoId
-if ($jogos.Count -ge 2) { $jogoCompra = $jogos[$jogos.Count - 1].id }
-if ($userId -and $jogoCompra) {
-    $bCompra = Body 'compra.json' ('{"userId":"' + $userId + '","gameId":"' + $jogoCompra + '"}')
-    $rCompra = Resposta ($Gateway + '/api/jogos/' + $jogoCompra + '/comprar') 'POST' $bCompra $token
-    'POST /api/jogos/{id}/comprar = ' + $rCompra.Code + '  (esperado 202)  jogo=' + $jogoCompra
+# A compra do preflight NAO usa o jogo do bloco 4: usa o ULTIMO jogo do catalogo que NAO seja ele.
+# Motivo: o jogo escolhido no P9 e o que o video vai comprar, e so a PRIMEIRA compra daquele par
+# (usuario, jogo) devolve 202 e move o painel de pagamentos -- consumindo-o aqui, o bloco 4 cairia em
+# 400/409. Com o minimo de 3 jogos sempre existe outro candidato.
+$jogoVerificacao = $null
+for ($i = $jogos.Count - 1; $i -ge 0; $i--) {
+    $idCand = [string]$jogos[$i].id
+    if ($idCand -and ($idCand -ne $jogoDemo)) { $jogoVerificacao = $idCand; break }
+}
+if ($userId -and $jogoVerificacao) {
+    $bCompra = Body 'compra.json' ('{"userId":"' + $userId + '","gameId":"' + $jogoVerificacao + '"}')
+    $rCompra = Resposta ($Gateway + '/api/jogos/' + $jogoVerificacao + '/comprar') 'POST' $bCompra $token
+    'POST /api/jogos/{id}/comprar = ' + $rCompra.Code + '  (esperado 202)  jogo de verificacao=' + $jogoVerificacao
     '  corpo = ' + $rCompra.Texto
     # SO 202 e [OK]: e a compra ACEITA que publica OrderPlacedEvent e move o painel "Pagamentos
     # processados por status" do bloco 4. 400/409 costumam ser "o usuario de demonstracao ja possui
@@ -420,28 +531,30 @@ if ($userId -and $jogoCompra) {
     if ($compraAceita) {
         Chk $compraAceita 'compra-aceita-202'
     } else {
-        Write-Output ('ATENCAO: a compra devolveu ' + $rCompra.Code + ' em vez de 202 -- o painel de pagamentos')
-        Write-Output 'ATENCAO: so se move com uma compra ACEITA. Se o corpo acima falar de posse/jogo, crie'
-        Write-Output 'ATENCAO: um jogo novo antes de gravar o bloco 4.'
+        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' em vez de 202 (o usuario')
+        Write-Output 'ATENCAO: de demonstracao ja possui ESTE jogo). O bloco 4 do video NAO e afetado: o jogo'
+        Write-Output 'ATENCAO: dele foi escolhido no P9 justamente por NAO estar na biblioteca. O que se perde'
+        Write-Output 'ATENCAO: aqui e apenas a evidencia de que o fluxo de pagamento responde 202 nesta rodada.'
         Write-Output '(esta situacao NAO entra na contagem de checagens: a compra nao foi aceita)'
     }
 } else {
-    'sem userId no token ou sem jogo: a compra do bloco 4 do video nao pode ser exercitada'
+    'sem userId no token ou sem jogo de verificacao: a compra do bloco 4 do video nao pode ser exercitada'
     Chk $false 'compra-aceita-202'
 }
-if ($jogoId) {
-    # O PUT e upsert por (gameId, userId): 201 na primeira avaliacao e 200 ao atualizar.
+if ($jogoDemo) {
+    # O PUT e upsert por (gameId, userId): 201 na primeira avaliacao e 200 ao atualizar. E o MESMO
+    # jogo do bloco 4 (o escolhido no P9), para o roteiro ter um id so.
     $bAval = Body 'avaliacao.json' '{"nota":5,"comentario":"Otimo jogo","tags":["acao"]}'
-    $rAval = Resposta ($Gateway + '/api/jogos/' + $jogoId + '/avaliacoes') 'PUT' $bAval $token
+    $rAval = Resposta ($Gateway + '/api/jogos/' + $jogoDemo + '/avaliacoes') 'PUT' $bAval $token
     'PUT /api/jogos/{id}/avaliacoes = ' + $rAval.Code + '  (esperado 201 na primeira, 200 na atualizacao)'
     Chk (@('200', '201') -contains $rAval.Code) 'avaliacao-upsert-200-ou-201'
-    $rListaAval = Resposta ($Gateway + '/api/jogos/' + $jogoId + '/avaliacoes') 'GET' $null $token
+    $rListaAval = Resposta ($Gateway + '/api/jogos/' + $jogoDemo + '/avaliacoes') 'GET' $null $token
     'GET /api/jogos/{id}/avaliacoes = ' + $rListaAval.Code + '  (esperado 200: a lista vem do Mongo)'
     Chk ($rListaAval.Code -eq '200') 'avaliacao-listagem-200'
     # Depois deste preflight a avaliacao do usuario de demonstracao JA existe: no video o PUT do
     # bloco 5 devolve 200 (atualizacao), nao 201 -- e isso tambem e a prova do upsert.
 } else {
-    'sem jogo no catalogo: a avaliacao do bloco 5 do video nao pode ser exercitada'
+    'sem jogo escolhido: a avaliacao do bloco 5 do video nao pode ser exercitada'
     Chk $false 'avaliacao-upsert-200-ou-201'
     Chk $false 'avaliacao-listagem-200'
 }
@@ -484,8 +597,10 @@ if ($script:falhas -gt 0) {
 } else {
     Write-Output 'TUDO PRONTO PARA GRAVAR'
     Write-Output ('  usuario de demonstracao: ' + $Email + ' (senha em FCG_DEMO_SENHA; o bloco do Gateway faz login com ele)')
-    Write-Output ('  jogos no catalogo: ' + $jogos.Count + ' -- o bloco NoSQL e o de pagamentos do video usam o PRIMEIRO id')
-    Write-Output '  (a compra deste preflight foi no ULTIMO jogo de proposito: a primeira compra daquele par usuario+jogo e a que devolve 202)'
+    Write-Output ('  jogos no catalogo: ' + $jogos.Count)
+    Write-Output ('  jogo do bloco 4 (compra) = ' + $jogoDemoNome + ' (' + $jogoDemo + ')  -- e o mesmo id serve para o bloco 5 (avaliacoes)')
+    Write-Output '  (este jogo e o primeiro do catalogo que o usuario demo NAO possui: a primeira compra dele devolve 202 e move o painel)'
+    Write-Output '  (a compra de verificacao deste preflight foi em OUTRO jogo, de proposito, para nao consumir o do bloco 4)'
     Write-Output '  funcao de notificacoes: 0 replicas (o cadastro do bloco serverless sobe o pod em ~15-30s)'
     Write-Output '  roteiro: docs/roteiro-video-fase3.md'
 }

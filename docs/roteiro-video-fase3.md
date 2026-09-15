@@ -26,9 +26,21 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 
    Esperado na última linha: **`TUDO PRONTO PARA GRAVAR`**. Se sair qualquer `[FALHOU]`, corrija antes de gravar — o preflight termina com `exit 1`.
 
+   No resumo ele imprime **o jogo que o bloco 4 deve comprar** (o primeiro do catálogo que o usuário demo **não** possui — o catálogo volta ordenado por nome e a biblioteca cresce a cada rodada, então "o primeiro id" não serve):
+
+   ```
+   jogo do bloco 4 (compra) = <nome> (<id>)  -- e o mesmo id serve para o bloco 5 (avaliacoes)
+   ```
+
+   Guarde esse id na sessão **antes de apertar REC** (o bloco 4 lê `$env:FCG_DEMO_JOGO`; assim nenhum GUID é digitado na gravação):
+
+   ```powershell
+   $env:FCG_DEMO_JOGO = '<id-impresso-na-linha-jogo-do-bloco-4>'
+   ```
+
 2. **A senha da demonstração vive só na variável de ambiente** `FCG_DEMO_SENHA` (o preflight e o gerador de tráfego leem dela; nenhum dos dois tem senha padrão no arquivo). Ela precisa atender à política do cadastro: **8+ caracteres, com ao menos uma letra, um dígito e um caractere especial**.
-3. **Estado inicial esperado:** os 11 pods de infraestrutura/APIs `Running` e `Ready`, o Promtail `Running`, a função de notificações em **0 réplicas** (nenhum pod) e o usuário `demo@fcg.local` já existente, com o catálogo contendo pelo menos **2 jogos** — é o que o preflight deixa pronto.
-4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` definida. O **diretório de sessão** que guarda os corpos de requisição nasce no passo 0 do bloco 2 e é apagado no fechamento (bloco 6) — mantenha o T1 do começo ao fim, ou repita o passo 0.
+3. **Estado inicial esperado:** os 11 pods de infraestrutura/APIs `Running` e `Ready`, o Promtail `Running`, a função de notificações em **0 réplicas** (nenhum pod) e o usuário `demo@fcg.local` já existente, com o catálogo contendo pelo menos **3 jogos** (o mínimo que garante um jogo livre para a compra do bloco 4 mesmo depois de rodadas anteriores) — é o que o preflight deixa pronto.
+4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` e `$env:FCG_DEMO_JOGO` definidas. O **diretório de sessão** que guarda os corpos de requisição nasce no passo 0 do bloco 2 e é apagado no fechamento (bloco 6) — mantenha o T1 do começo ao fim, ou repita o passo 0.
 5. **Navegador preparado:** deixe as abas já posicionadas antes de gravar (o Grafana e o Prometheus só respondem depois que os `port-forward` dos blocos 3 e 4 subirem — deixe-os ativos até o fim, sem reabrir):
    - Grafana — `http://localhost:13000` (login `admin` e a senha do Secret `grafana-admin`);
    - Prometheus — `http://localhost:19090/targets`;
@@ -196,7 +208,11 @@ kubectl port-forward svc/prometheus 19090:9090
 
 ```powershell
 $token  = Login-FCG
-$gameId = ((curl.exe -s -H "Authorization: Bearer $token" http://localhost:8000/api/jogos | ConvertFrom-Json) | Select-Object -First 1).id
+# O JOGO DO BLOCO 4 nao e "o primeiro do catalogo": e o que o preflight IMPRIMIU na linha
+# "jogo do bloco 4 (compra) = <nome> (<id>)" (o catalogo volta ordenado por NOME e a biblioteca do
+# usuario demo cresce a cada rodada -- comprar um jogo que ele ja possui devolve 400 e o painel de
+# pagamentos nao se move). O id foi guardado na variavel de ambiente antes de apertar REC:
+$gameId = $env:FCG_DEMO_JOGO
 
 # O userId vem do claim Id do TOKEN (o corpo com usuarioId e ignorado, por contrato do endpoint):
 $p = ($token -split '\.')[1].Replace('-','+').Replace('_','/')
@@ -209,7 +225,7 @@ curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos
     -H "Content-Type: application/json" -H "Authorization: Bearer $token" -d ('@' + (Join-Path $dirDemo 'compra.json'))
 ```
 
-**Na tela:** `compra=202` (aceita e assíncrona) e, em até ~30 s (scrape de 15 s + processamento), as séries **`Approved`/`Rejected`** do painel *Pagamentos processados por status* subindo.
+**Na tela:** `compra=202` (aceita e assíncrona) e, em até ~30 s (scrape de 15 s + processamento), as séries **`Approved`/`Rejected`** do painel *Pagamentos processados por status* subindo. Se vier **`400`**, o jogo já estava na biblioteca do usuário: **pare e rode o preflight de novo** — ele reescolhe um jogo livre e imprime a linha `jogo do bloco 4` — em vez de gravar um bloco sem evidência.
 
 **Narração — o ponto que costuma ser mal entendido:** "o `payments-api` **não recebe requisição nenhuma do gateway**: ele é consumidor de fila. Quem move o painel dele é o **fluxo de eventos** — cada compra publica `OrderPlacedEvent` e incrementa o contador de negócio `fcg_payments_processados_total`. E os painéis de tráfego **excluem as probes `/health`**: o número que aparece é tráfego de negócio, não probe."
 
@@ -309,4 +325,8 @@ Corte **nesta ordem**, e só até caber em 10:00:
 
 ## Apoio: o que o preflight garante para esta gravação
 
-`scripts/preflight-fase3.ps1` roda **antes** de gravar e falha (`exit 1`) se qualquer peça do vídeo não estiver no ar: os 11 pods e o promtail, os **4 PVCs `Bound`**, o gateway (`401` sem token e `200` com token), os três alvos do job `fcg-apis` no Prometheus, o Loki `ready` e com log recente da stack (se ainda não houver log da **função** nas últimas 24 h, ele **avisa** em vez de reprovar — o cadastro do bloco 3 gera esse log ao vivo), o datasource e os dois dashboards do Grafana, as **três filas `notifications-*`** com o `ScaledObject Ready=True` (sem fila o KEDA cai em `TriggerError` e a **função simplesmente não sobe** — falha silenciosa que só apareceria na gravação), o Redis com as chaves `catalog:*`, o Mongo respondendo e — o mais importante — o **usuário e os jogos de demonstração**, além da **função em 0 réplicas** no estado inicial. Ele também **exercita os comandos que só aparecem no vídeo**: as séries dos painéis em `/metrics` dos três serviços (pelo proxy do `kubectl`), a **compra** (`202`) e o `PUT`/`GET` de **avaliação** (upsert) — assim nenhum bloco do roteiro leva um comando que nunca rodou. `scripts/demo-trafego.ps1 -Segundos 90` é o gerador do bloco 4; os dois leem a senha de `$env:FCG_DEMO_SENHA` e **não** têm senha padrão no arquivo.
+`scripts/preflight-fase3.ps1` roda **antes** de gravar e falha (`exit 1`) se qualquer peça do vídeo não estiver no ar: os 11 pods e o promtail, os **4 PVCs `Bound`**, o gateway (`401` sem token e `200` com token), os três alvos do job `fcg-apis` no Prometheus, o Loki `ready` e com log recente da stack (se ainda não houver log da **função** nas últimas 24 h, ele **avisa** em vez de reprovar — o cadastro do bloco 3 gera esse log ao vivo), o datasource e os dois dashboards do Grafana, as **três filas `notifications-*`** com o `ScaledObject Ready=True` (sem fila o KEDA cai em `TriggerError` e a **função simplesmente não sobe** — falha silenciosa que só apareceria na gravação), o Redis com as chaves `catalog:*`, o Mongo respondendo e — o mais importante — o **usuário e os jogos de demonstração**, além da **função em 0 réplicas** no estado inicial.
+
+Sobre os dados de demonstração, ele garante **3 jogos** no catálogo, promove o usuário demo a Admin se precisar criar jogos (SQL por dentro do pod, digitado por **stdin**), **lê a biblioteca do usuário** (`GET /api/biblioteca/{userId}`) e escolhe/impressiona o **jogo do bloco 4**: o primeiro do catálogo que o usuário **não** possui — é esse id que vai em `$env:FCG_DEMO_JOGO` e que o bloco 4 (compra) e o bloco 5 (avaliações) usam. A **compra de verificação** que ele faz em seguida usa **outro** jogo, de propósito: comprar o do bloco 4 aqui consumiria a primeira compra daquele par (usuário, jogo), que é justamente a que devolve `202` e move o painel de pagamentos no vídeo.
+
+Ele também **exercita os comandos que só aparecem no vídeo**: as séries dos painéis em `/metrics` dos três serviços (pelo proxy do `kubectl`), a **compra** (`202`) e o `PUT`/`GET` de **avaliação** (upsert) — assim nenhum bloco do roteiro leva um comando que nunca rodou. `scripts/demo-trafego.ps1 -Segundos 90` é o gerador do bloco 4; os dois leem a senha de `$env:FCG_DEMO_SENHA` e **não** têm senha padrão no arquivo.
