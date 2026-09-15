@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-data
+  labels:
+    app: rabbitmq
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +20,9 @@ metadata:
     app: rabbitmq
 spec:
   replicas: 1
+  # O PVC e ReadWriteOnce: num rolling update o pod novo ficaria preso esperando o volume.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: rabbitmq
@@ -31,6 +48,15 @@ spec:
               value: "guest"
             - name: RABBITMQ_DEFAULT_PASS
               value: "guest"
+          # /var/lib/rabbitmq e o RABBITMQ_MNESIA_BASE: filas, exchanges e mensagens moram
+          # aqui. Sem fsGroup de proposito -- o container roda como root (uid 0).
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rabbitmq-data
 ---
 apiVersion: v1
 kind: Service

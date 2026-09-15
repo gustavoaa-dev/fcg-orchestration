@@ -597,6 +597,38 @@ Esta fase acrescenta dois serviços de dados ao cluster — **MongoDB** para as 
 | MongoDB | `mongo:8.0.30` | PVC `mongo-data` (1Gi, `standard`) | `strategy: Recreate` de propósito: o PVC é `ReadWriteOnce` e, em rolling update, o pod novo ficaria preso esperando o volume — a mesma razão do Prometheus |
 | Redis | `redis:7.4.11-alpine3.21` | **nenhuma** (é cache) | Sem PVC por decisão: perder o conteúdo é aceitável porque a fonte de verdade é o SQL. `--maxmemory 128mb --maxmemory-policy allkeys-lru` |
 
+### Persistência do estado no cluster (PVCs)
+
+**Em Kubernetes, um restart de container descarta o filesystem do container.** Recriar o pod — um container que reinicia, um `kubectl delete pod`, um `rollout`, um nó que volta — não conserva nada do que foi escrito fora de um volume: o container novo nasce limpo, a partir da imagem. Foi o que aconteceu neste cluster em **15/09**, e o defeito demorou a aparecer porque **o schema volta e o dado não**:
+
+- **O banco se foi.** O container do `sqlserver` reiniciou (`restartCount: 3`) e o `FCG_Users` amanheceu com **1 usuário** e o `FCG_Catalog` com **0 jogos** — 14h antes a base tinha 6 jogos e vários usuários. O schema "retorna" porque as três APIs rodam `Database.Migrate()` no boot, e é isso que **mascara** a perda: a migração recria as tabelas, vazias.
+- **O broker se foi junto.** As filas `notifications-user-created` e `notifications-payment-processed` (declaradas pelo Terraform) desapareceram, e o `ScaledObject` da função serverless caiu para `Ready=False` / `TriggerError` (`404 NOT_FOUND - no queue 'notifications-user-created' in vhost '/'`): a função **parou de subir**, sem nenhum sinal no pod dela. As exchanges do MassTransit voltaram sozinhas (cada serviço as redeclara ao reconectar); as do Terraform, não.
+
+A regra adotada é a mesma que o `prometheus-data` já seguia: **dado que precisa sobreviver a um restart mora em volume.** Com isso, os **três serviços com estado** do cluster têm PVC:
+
+| Serviço | PVC | Montado em | Por quê |
+|---|---|---|---|
+| SQL Server | `sqlserver-data` (1Gi, `standard`) | `/var/opt/mssql` | Banco dos usuários, do catálogo e da biblioteca. O pod traz `securityContext.fsGroup: 10001` porque a imagem do `mssql` roda como **uid 10001 (`mssql`)** — sem o `fsGroup` o volume novo vem `root` e o SQL Server **não sobe** |
+| RabbitMQ | `rabbitmq-data` (1Gi, `standard`) | `/var/lib/rabbitmq` | É o `RABBITMQ_MNESIA_BASE` do broker: filas, exchanges e mensagens moram aí, e é uma dessas filas que o KEDA observa para escalar a função. **Sem** `securityContext` de propósito: medido em runtime, o container roda como **root (uid 0)** e não tem problema de permissão no volume novo |
+| MongoDB | `mongo-data` (1Gi, `standard`) | `/data/db` | Avaliações dos jogos (detalhes na tabela acima) |
+
+- **O `prometheus-data` já era assim** desde a stack de observabilidade: o TSDB fica em PVC de 2Gi e a retenção de 7 dias sobrevive ao pod ([Observabilidade](#observabilidade)). Os dois PVCs novos seguem exatamente o mesmo formato — `ReadWriteOnce`, `storageClassName: standard` e rótulo `app` igual ao do workload —, então a StorageClass `standard` continua sendo pré-requisito: sem ela o PVC fica `Pending`.
+- **Loki e Redis seguem sem volume, de propósito.** Os dois são `emptyDir`: no Redis a fonte de verdade é o SQL ([Por que Redis (cache do catálogo)](#por-que-redis-cache-do-catálogo)) e no Loki a retenção é de 24h ([Logs (Loki)](#logs-loki)). A diferença em relação aos três acima não é o descuido, é o conteúdo: o que Loki e Redis guardam **pode** ser reconstruído (ou simplesmente perdido) sem afetar cadastro, catálogo ou o disparo da função.
+- **Os dois Deployments novos usam `strategy: Recreate`**, como o do Mongo e o do Prometheus: o PVC é `ReadWriteOnce`, então num rolling update o pod novo ficaria preso esperando o volume que o antigo ainda usa e o rollout nunca terminaria.
+
+Conferindo os quatro PVCs e quem monta cada um:
+
+```bash
+kubectl get pvc
+kubectl get deployment sqlserver rabbitmq -o custom-columns=NAME:.metadata.name,STRATEGY:.spec.strategy.type
+kubectl exec deploy/sqlserver -- id   # uid=10001(mssql): e o fsGroup faz o volume novo pertencer a ele
+kubectl exec deploy/rabbitmq -- id    # uid=0(root): por isso o broker nao precisa de fsGroup
+```
+
+Esperado: `mongo-data`, `sqlserver-data`, `rabbitmq-data` e `prometheus-data` em `Bound`, e `Recreate` nos dois Deployments novos.
+
+A prova de que a persistência vale é **apagar o pod**, não apenas reiniciar o processo. Depois de `kubectl delete pod -l app=sqlserver` e do rollout concluído, o login de um usuário que já existia antes do delete continua respondendo **`200`** — antes desta correção, o mesmo teste devolvia **`400`**, com `{"mensagem":"Usuário não encontrado."}`. Depois de `kubectl delete pod -l app=rabbitmq`, o `rabbitmqctl list_queues name messages` continua listando as três filas `notifications-*` e o `ScaledObject` segue `Ready=True` (antes, as filas `notifications-*` sumiam e o KEDA caía em `TriggerError`).
+
 ### Por que MongoDB (avaliações)
 
 - **É dado gerado pelo usuário, com formato que varia.** A `nota` (1 a 5) é obrigatória, mas o `comentario` é opcional e `tags[]` é uma lista livre — em modelo relacional isso vira coluna anulável mais uma tabela de tags, com junção a cada leitura, sem nenhum ganho de integridade em troca.
