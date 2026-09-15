@@ -72,7 +72,19 @@
 # por stdin + "sqlcmd -i") e a do Grafana e o $GF_SECURITY_ADMIN_PASSWORD, expandido pelo shell de
 # DENTRO do pod (antes ela ia embutida na URL do wget e aparecia no ps do host e do pod).
 #
-# Uso: $env:FCG_DEMO_SENHA = '<senha>'; powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1
+# Uso (preflight completo, uma execucao antes de gravar):
+#   $env:FCG_DEMO_SENHA = '<senha>'; powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1
+#
+# GRAVACAO MODULAR (o video e gravado em 6 tomadas -- ver docs/roteiro-video-fase3.md):
+#   powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1 -Modulo N     (N = 1..6)
+#   Cada modulo VALIDA e PREPARA so o que a tomada dele precisa e termina em
+#   "TUDO PRONTO PARA GRAVAR O MODULO N" (ou "PREFLIGHT REPROVADO ... NAO GRAVE ainda", como hoje).
+#   O preparo e para ser rodado DE NOVO antes de cada retake: e ele que devolve o estado inicial
+#   daquela tomada (o jogo livre novo da compra, a funcao em 0 replicas, as portas livres...).
+#   Sem o parametro (-Modulo 0) o script e EXATAMENTE o de antes: as mesmas checagens e a mesma
+#   linha TUDO PRONTO PARA GRAVAR. O bloco do modo por modulo fica depois dos helpers e SAI do
+#   script quando termina, sem tocar em nenhuma linha do caminho completo.
+#   Os modulos 1 e 6 nao fazem login e por isso nao exigem FCG_DEMO_SENHA; os modulos 2 a 5 exigem.
 param(
     [string]$Gateway = 'http://localhost:8000',
     [string]$Email = 'demo@fcg.local',
@@ -80,7 +92,9 @@ param(
     # SEM default: a senha da demonstracao NAO pode ficar versionada (regra global de segredos).
     [string]$Senha = $env:FCG_DEMO_SENHA,
     [int]$JogosMinimos = 3,
-    [int]$EsperaCooldown = 180
+    [int]$EsperaCooldown = 180,
+    # 0 (default) = preflight completo, comportamento original. 1..6 = preparo de UMA tomada.
+    [ValidateRange(0, 6)][int]$Modulo = 0
 )
 
 $ErrorActionPreference = 'Continue'
@@ -290,18 +304,695 @@ function Token {
     return $null
 }
 
-if (-not $Senha) {
+# A senha so e exigida por quem faz login: o preflight completo e os modulos 2 a 5. Os modulos 1
+# (README + pods) e 6 (repositorios + evidencia de segredos) nao tocam em dado nenhum do cluster.
+$precisaSenha = (($Modulo -eq 0) -or (@(2, 3, 4, 5) -contains $Modulo))
+if ($precisaSenha -and (-not $Senha)) {
     Write-Output 'FALHOU: a senha da demonstracao nao foi informada.'
     Write-Output 'Defina a variavel de ambiente e rode de novo (a senha NUNCA e versionada):'
     Write-Output '  $env:FCG_DEMO_SENHA = ''<senha-da-demonstracao>'''
     Write-Output '  powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1'
     Write-Output 'A senha precisa atender a politica do cadastro: 8+ caracteres, com ao menos uma letra,'
     Write-Output 'um digito e um caractere especial.'
+    if ($Modulo -gt 0) {
+        Write-Output ('  (o modulo ' + $Modulo + ' faz login com o usuario de demonstracao e por isso exige a senha)')
+    }
     exit 1
 }
 $script:segredos += $Senha
 # O diretorio temporario so nasce depois da checagem da senha (nada e criado se ela faltar).
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+
+# ============================================================================================
+# MODO POR MODULO (-Modulo N): prepara UMA tomada da gravacao modular e TERMINA o script aqui.
+# Sem o parametro (-Modulo 0) NADA deste bloco roda: o preflight completo abaixo segue identico.
+# O que cada modulo valida e prepara:
+#   1  os 11 pods da plataforma + promtail Running e o README com a secao Arquitetura. Nao consome nada.
+#   2  os pods + gateway (401 sem token, login 200, 200 com token) + usuario demo EXISTENTE (cria se
+#      faltar) + porta 8001 livre no host (o port-forward da Admin API e desta tomada) + a config do
+#      Kong SEM rota para o payments-api e COM o plugin jwt (lida do Secret; so o resumo e impresso).
+#   3  os pods + as 3 filas notifications-* + ScaledObject Ready=True + Loki ready com log da funcao na
+#      janela de 24h + Grafana com o datasource/dashboard de logs + porta 13000 livre + a funcao em
+#      0 replicas (espera ate 120s o cooldown do KEDA). NAO faz cadastro: o cadastro e da tomada.
+#   4  as portas 13000/19090 livres + os 3 alvos up no Prometheus + o dashboard FCG - APIs + um JOGO
+#      LIVRE garantido e impresso para a compra (cria um se o demo possuir todos -- e o que protege o
+#      RETAKE) + o contador fcg_payments_processados_total no /metrics (com uma compra de verificacao em
+#      OUTRO jogo livre, so quando o cluster esta frio).
+#   5  o jogo da tomada (FCG_DEMO_JOGO, ou reelegido e impresso) + o PUT/GET de avaliacoes (upsert) +
+#      as chaves catalog:* no Redis + os contadores cache_hit/cache_miss.
+#   6  os 5 repositorios locais sem alteracao pendente + a evidencia de segredos devolvendo vazio + o
+#      link do repositorio da funcao e a secao de requisitos no README.
+# ============================================================================================
+if ($Modulo -gt 0) {
+
+    # A porta esta livre se da para BINDAR nela agora: e a porta que o port-forward da tomada vai usar.
+    function PortaLivre($porta) {
+        $ouvinte = $null
+        try {
+            $ouvinte = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $porta)
+            $ouvinte.Start()
+            $ouvinte.Stop()
+            return $true
+        } catch {
+            if ($ouvinte) { try { $ouvinte.Stop() } catch { } }
+            return $false
+        }
+    }
+
+    # Os 11 pods da plataforma + o promtail (DaemonSet, quem coleta o log): e o que a abertura mostra.
+    function ChecarPodsDaPlataforma() {
+        'pods do namespace:'
+        kubectl get -n $namespace pods --no-headers 2>&1 | ForEach-Object { '  ' + $_ }
+        foreach ($app in @('sqlserver', 'rabbitmq', 'mongo', 'redis', 'users-api', 'catalog-api', 'payments-api', 'kong', 'prometheus', 'grafana', 'loki')) {
+            Chk ((Prontos ('app=' + $app)) -ge 1) ('pod-' + $app + '-1/1-Running')
+        }
+        Chk ((Prontos 'app=promtail') -ge 1) 'pod-promtail-1/1-Running'
+    }
+
+    # CONTRATO DAS FUNCOES DESTE MODO: elas IMPRIMEM as linhas na tela e por isso NAO devolvem valor --
+    # o resultado sai nas variaveis de escopo de script abaixo. Devolver o token (ou o jogo) junto com
+    # as linhas impressas faria o PowerShell juntar tudo num array e o valor viraria lixo.
+    $script:tomadaToken = $null
+    $script:tomadaJogoId = ''
+    $script:tomadaJogoNome = ''
+    $script:tomadaJogos = @()
+    $script:tomadaBiblioteca = @()
+    $script:grafanaDatasources = @()
+    $script:grafanaDashboards = @()
+
+    # O usuario de demonstracao PRECISA existir (as tomadas 2, 4 e 5 fazem login com ele): se o login
+    # falhar, o preparo CRIA o usuario pelo gateway, como o preflight completo faz no P3.
+    function GarantirUsuarioDemo() {
+        $t = Token
+        'POST /api/auth/login = ' + $script:ultimoLogin + '  (esperado 200)'
+        if (-not $t) {
+            'login falhou: criando o usuario de demonstracao pelo gateway (POST /api/usuarios)...'
+            $bCad = Body 'cadastro-demo.json' ('{"nome":"' + $Nome + '","email":"' + $Email + '","senha":"' + $Senha + '"}')
+            $rCad = Resposta ($Gateway + '/api/usuarios') 'POST' $bCad $null
+            'POST /api/usuarios = ' + $rCad.Code + '  (esperado 201)'
+            if ($rCad.Code -eq '400') {
+                'ATENCAO: o cadastro respondeu 400 -- o e-mail ja existe com OUTRA senha (o login falhou)'
+                'ATENCAO: ou a senha nao atende a politica (8+ caracteres, com letra, digito e caractere especial).'
+            }
+            $t = Token
+            if ($t) {
+                Write-Output '*** AVISO: o usuario de demonstracao NAO existia e foi CRIADO agora pelo preflight. ***'
+                Write-Output '*** AVISO: a criacao publica UserCreatedEvent e ACORDA a funcao serverless: se a proxima ***'
+                Write-Output '*** AVISO: tomada for a do modulo 3, o preparo dela espera o cooldown antes de liberar. ***'
+            }
+        }
+        Chk ([bool]$t) 'usuario-de-demonstracao-login-200'
+        if ($t) { 'token obtido: ' + $t.Length + ' caracteres (valor nunca e impresso)' }
+        $script:tomadaToken = $t
+    }
+
+    # O JOGO DA TOMADA: o primeiro do catalogo que o usuario demo NAO possui (o catalogo volta ordenado
+    # por NOME e a biblioteca cresce a cada rodada). Se ele possuir todos, o preparo CRIA um jogo novo --
+    # e por isso rodar o preparo de novo antes de um RETAKE devolve um jogo livre: sem isso a compra da
+    # tomada responderia 400 ("ja possui este jogo") e o painel de pagamentos nao se mexeria na tela.
+    # A posse e VERIFICADA (existe no catalogo E nao esta na biblioteca lida) e o id fica impresso para
+    # o apresentador copiar para $env:FCG_DEMO_JOGO antes de apertar REC.
+    function GarantirJogoLivre() {
+        $script:tomadaJogoId = ''
+        $script:tomadaJogoNome = ''
+        $script:tomadaJogos = @()
+        $script:tomadaBiblioteca = @()
+        if (-not $script:tomadaToken) { return }
+        $userId = Claim $script:tomadaToken 'Id'
+        'userId (claim Id do token) = ' + $userId
+        $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $script:tomadaToken
+        $jogos = @($lista.Body | Where-Object { $_ -ne $null })
+        'GET /api/jogos = ' + $lista.Code + '  jogos no catalogo = ' + $jogos.Count
+        Chk ($lista.Code -eq '200' -and $lista.ParseOk) 'catalogo-listagem-200'
+        if (-not $lista.ParseOk) {
+            Write-Output ('FALHOU: GET /api/jogos respondeu ' + $lista.Code + ' com um corpo que NAO deu para ler como')
+            Write-Output 'FALHOU: JSON: nao ha catalogo para escolher o jogo da tomada, e NADA sera criado a partir dele.'
+            return
+        }
+        $idsBiblioteca = @()
+        $bibliotecaLida = $false
+        if ($userId) {
+            $bib = Resposta ($Gateway + '/api/biblioteca/' + $userId) 'GET' $null $script:tomadaToken
+            'GET /api/biblioteca/{userId} = ' + $bib.Code + '  (a biblioteca do usuario demo)'
+            if ($bib.Code -eq '200') {
+                $itens = @(ItensDaBiblioteca $bib.Body)
+                $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
+                $interpretavel = ($bib.ParseOk -and (($itens.Count -eq 0) -or ($idsBiblioteca.Count -eq $itens.Count)))
+                'biblioteca do usuario demo = ' + $itens.Count + ' item(ns), ' + $idsBiblioteca.Count + ' id(s) reconhecido(s)'
+                Chk $interpretavel 'biblioteca-do-usuario-200'
+                if ($interpretavel) {
+                    $bibliotecaLida = $true
+                } else {
+                    Write-Output 'FALHOU: a biblioteca respondeu 200 com um corpo que nao deu para interpretar (contrato):'
+                    Write-Output 'FALHOU: sem os ids a posse NAO pode ser verificada e a compra do video poderia dar 400.'
+                }
+            } elseif ($bib.Code -eq '404') {
+                Write-Output 'ATENCAO: GET /api/biblioteca/{userId} respondeu 404: o usuario demo ainda nao tem'
+                Write-Output 'ATENCAO: biblioteca (nada possuido), entao qualquer jogo do catalogo esta livre.'
+                Write-Output '(esta situacao NAO entra na contagem de checagens: e estado legitimo, nao falha)'
+            } else {
+                Write-Output ('FALHOU: GET /api/biblioteca/{userId} devolveu ' + $bib.Code + ' -- sem a biblioteca a posse do')
+                Write-Output 'FALHOU: jogo da tomada NAO pode ser verificada (a compra do video poderia responder 400).'
+                Chk $false 'biblioteca-do-usuario-200'
+            }
+        }
+        $jogo = $null
+        $nome = ''
+        $tentativa = 0
+        while ((-not $jogo) -and ($tentativa -lt 3)) {
+            $tentativa++
+            for ($i = 0; $i -lt $jogos.Count; $i++) {
+                $idCand = [string]$jogos[$i].id
+                if ($idCand -and ($idsBiblioteca -notcontains $idCand.ToLower())) { $jogo = $idCand; $nome = [string]$jogos[$i].nome; break }
+            }
+            if (-not $jogo) {
+                # Todos os jogos do catalogo ja sao dele: cria mais um (o POST de jogo exige Admin).
+                'todos os jogos do catalogo ja estao na biblioteca do usuario demo: criando mais um'
+                $nomeExtra = 'Jogo Demo Livre Tomada ' + $tentativa
+                $bExtra = Body ('jogo-extra-tomada-' + $tentativa + '.json') ('{"nome":"' + $nomeExtra + '","descricao":"Jogo livre para a compra do video","preco":89.90}')
+                $rExtra = Resposta ($Gateway + '/api/jogos') 'POST' $bExtra $script:tomadaToken
+                'POST /api/jogos = ' + $rExtra.Code + '  (esperado 201)  nome=' + $nomeExtra
+                if ($rExtra.Code -ne '201') {
+                    $saExtra = SecretValor 'sqlserver-secret' 'sa-password'
+                    if ($saExtra) {
+                        $script:segredos += $saExtra
+                        'POST recusado (' + $rExtra.Code + '): promovendo o usuario demo a Admin e tentando de novo'
+                        $promoExtra = PromoverDemoAdmin $Email
+                        'Role lido do SQL depois do UPDATE = [' + ($promoExtra.Role -replace "`r?`n", ' ') + ']  (esperado 1)'
+                        $tNovo = Token
+                        if ($tNovo) { $script:tomadaToken = $tNovo }
+                        $rExtra = Resposta ($Gateway + '/api/jogos') 'POST' $bExtra $script:tomadaToken
+                        'POST /api/jogos (apos a promocao) = ' + $rExtra.Code + '  (esperado 201)'
+                    } else {
+                        'NAO consegui ler o Secret sqlserver-secret/sa-password: nao ha como promover o usuario'
+                    }
+                    if ($rExtra.Code -ne '201') { break }
+                }
+                $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $script:tomadaToken
+                $jogos = @($lista.Body | Where-Object { $_ -ne $null })
+            }
+        }
+        $idsCatalogo = @($jogos | ForEach-Object { ([string]$_.id).ToLower() })
+        $idEscolhido = ''
+        if ($jogo) { $idEscolhido = ([string]$jogo).ToLower() }
+        $existeNoCatalogo = [bool]($idEscolhido -and ($idsCatalogo -contains $idEscolhido))
+        if ($bibliotecaLida) {
+            $estaNaBiblioteca = ($idsBiblioteca -contains $idEscolhido)
+            $livre = [bool]($existeNoCatalogo -and (-not $estaNaBiblioteca))
+            if ($estaNaBiblioteca) {
+                Write-Output ('FALHOU: o jogo escolhido para a tomada (' + $jogo + ') ESTA na biblioteca do usuario demo:')
+                Write-Output 'FALHOU: a compra do video responderia 400 e o painel de pagamentos nao se mexeria.'
+            }
+            if (-not $existeNoCatalogo) {
+                Write-Output ('FALHOU: o jogo escolhido (' + $jogo + ') nao esta na lista do catalogo lida.')
+            }
+            'jogo da tomada livre = ' + $livre + '  (existe no catalogo=' + $existeNoCatalogo + '  esta na biblioteca=' + $estaNaBiblioteca + ')'
+            Chk $livre 'jogo-do-bloco-4-escolhido'
+        } else {
+            if ($existeNoCatalogo) {
+                Write-Output 'ATENCAO: sem a biblioteca lida nao da para garantir que o jogo escolhido esta livre'
+                Write-Output ('ATENCAO: (ele existe no catalogo=' + $existeNoCatalogo + ', mas a posse nao foi verificada).')
+                Write-Output '(esta situacao NAO entra na contagem de checagens: a posse nao pode ser verificada)'
+            } else {
+                Write-Output 'FALHOU: nenhum jogo valido foi escolhido para a tomada -- sem jogo, a compra do modulo 4'
+                Write-Output 'FALHOU: ficaria sem o que comprar e o painel de pagamentos sem evidencia.'
+                Chk $false 'jogo-do-bloco-4-escolhido'
+            }
+        }
+        $script:tomadaJogos = $jogos
+        $script:tomadaBiblioteca = $idsBiblioteca
+        if ($jogo) {
+            $script:tomadaJogoId = [string]$jogo
+            $script:tomadaJogoNome = [string]$nome
+        }
+    }
+
+    # As 3 filas do broker e o ScaledObject Ready (sem fila o KEDA cai em TriggerError e a funcao
+    # simplesmente NAO SOBE -- falha silenciosa que so apareceria na gravacao).
+    function ChecarKedaEFilas() {
+        $filas = (San (((kubectl exec -n $namespace deploy/rabbitmq -- rabbitmqctl list_queues name 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+        'filas do broker (rabbitmqctl list_queues name):'
+        $filas -split "`n" | Where-Object { $_ -match '\S' } | ForEach-Object { '  ' + $_.Trim() }
+        foreach ($fila in @('notifications-user-created', 'notifications-payment-processed', 'notifications-dead-letter')) {
+            Chk ($filas -match [regex]::Escape($fila)) ('fila-' + $fila)
+        }
+        $so = $null
+        try { $so = (kubectl get -n $namespace scaledobject notifications-function -o json 2>&1 | Out-String | ConvertFrom-Json) } catch { $so = $null }
+        if ($so) {
+            $readySo = ($so.status.conditions | Where-Object { $_.type -eq 'Ready' }).status
+            'ScaledObject notifications-function Ready=' + $readySo + '  min=' + $so.spec.minReplicaCount + ' max=' + $so.spec.maxReplicaCount
+            Chk ($readySo -eq 'True') 'scaledobject-Ready-True'
+            if ($readySo -ne 'True') {
+                'TriggerError costuma ser fila ausente no broker: rode o terraform apply do repositorio da funcao.'
+            }
+        } else {
+            'ScaledObject notifications-function nao encontrado: a funcao nao esta implantada (terraform apply do repo dela)'
+            Chk $false 'scaledobject-Ready-True'
+        }
+    }
+
+    # Loki pronto e com log: o painel que a tomada do modulo 3 mostra e o do Loki, e o log DA FUNCAO e o
+    # que prova que ela rodou. O rotulo da funcao so nasce depois de ela subir uma vez na retencao de
+    # 24h: quando ele ainda nao existe a situacao e ATENCAO (sem contar checagem), porque o cadastro da
+    # propria tomada gera a linha ao vivo -- reprovar por isso bloquearia uma gravacao valida.
+    function ChecarLokiELogDaFuncao() {
+        $ready = (Kraw ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/ready')).Trim()
+        'loki /ready = ' + $ready + '  (esperado ready)'
+        Chk ($ready -eq 'ready') 'loki-ready'
+        $rotulos = @()
+        for ($i = 0; $i -lt 4; $i++) {
+            try {
+                $resp = (Kraw ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/loki/api/v1/label/app/values'))
+                $lido = ($resp | ConvertFrom-Json).data
+                # @($null) conta como UM elemento no PowerShell: o filtro evita aprovar sem ter lido nada.
+                $rotulos = @($lido | Where-Object { $_ -ne $null })
+            } catch { $rotulos = @() }
+            if ($rotulos.Count -gt 0) { break }
+            Start-Sleep -Seconds 5
+        }
+        'rotulos app no Loki = ' + $(if ($rotulos.Count -gt 0) { $rotulos -join ', ' } else { '(nenhum)' })
+        Chk ($rotulos.Count -ge 1) 'loki-rotulo-app-com-log'
+        $temLogDaFuncao = ($rotulos -contains 'notifications-function')
+        if ($temLogDaFuncao) {
+            # O filtro vai URL-encoded ({app="notifications-function"} tem chaves e aspas, que o
+            # PowerShell 5.1 nao entrega inteiras em argumento de processo nativo).
+            $agoraLoki = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $caminhoLinhas = ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/loki/api/v1/query_range?query=%7Bapp%3D%22notifications-function%22%7D&limit=20&start=' + ($agoraLoki - 86400) + '&end=' + $agoraLoki)
+            $linhasFuncao = 0
+            $respostaLinhas = ''
+            try {
+                $respostaLinhas = Kraw $caminhoLinhas
+                $jsonLinhas = ($respostaLinhas | ConvertFrom-Json)
+                foreach ($fluxo in @($jsonLinhas.data.result | Where-Object { $_ -ne $null })) {
+                    if ($fluxo.values) { $linhasFuncao += @($fluxo.values | Where-Object { $_ -ne $null }).Count }
+                }
+            } catch { $linhasFuncao = 0 }
+            'linhas de notifications-function na janela de 24h = ' + $linhasFuncao + '  (esperado >= 1)'
+            if ($linhasFuncao -lt 1) {
+                Write-Output 'FALHOU: o rotulo notifications-function existe no Loki, mas nenhuma LINHA foi lida na'
+                Write-Output 'FALHOU: janela de 24h -- o painel de logs da tomada nao teria o que mostrar. Remedio: um'
+                Write-Output 'FALHOU: cadastro pelo gateway gera uma linha nova; se ainda assim nao aparecer, confira'
+                Write-Output 'FALHOU: o Promtail (k8s/promtail-deployment.yaml), que e quem coleta o log dos pods.'
+                $amostraLinhas = (San ((([string]$respostaLinhas) -replace '\s+', ' '))).Trim()
+                if ($amostraLinhas.Length -gt 300) { $amostraLinhas = $amostraLinhas.Substring(0, 300) }
+                Write-Output ('  resposta do Loki (resumida) = ' + $(if ($amostraLinhas) { $amostraLinhas } else { '(vazia)' }))
+            }
+            Chk ($linhasFuncao -ge 1) 'loki-log-da-funcao-de-notificacoes'
+        } else {
+            Write-Output 'ATENCAO: ainda nao ha log de notifications-function no Loki (a funcao nao rodou nas ultimas'
+            Write-Output 'ATENCAO: 24h). A tomada continua valida: o cadastro dela acorda a funcao e a linha aparece'
+            Write-Output 'ATENCAO: ao vivo no painel -- e essa linha viva que o modulo 3 mostra.'
+            Write-Output '(esta situacao NAO entra na contagem de checagens: nao ha o que verificar ainda)'
+        }
+    }
+
+    # Saude, datasources e dashboards do Grafana (a senha e lida do Secret em memoria e nunca e impressa).
+    function GrafanaAberto() {
+        $script:senhaGrafana = SecretValor 'grafana-admin' 'admin-password'
+        if ($script:senhaGrafana) {
+            $script:segredos += $script:senhaGrafana
+            $script:segredos += [uri]::EscapeDataString($script:senhaGrafana)
+        }
+        $health = $null
+        try { $health = (GrafanaApi '/api/health' | ConvertFrom-Json) } catch { $health = $null }
+        'grafana /api/health = ' + $(if ($health) { 'database=' + $health.database + ' version=' + $health.version } else { '(sem resposta)' })
+        Chk ($health -and $health.database -eq 'ok') 'grafana-health-ok'
+        $ds = @()
+        try { $ds = @(GrafanaApi '/api/datasources' | ConvertFrom-Json) } catch { $ds = @() }
+        $uidsDs = @($ds | ForEach-Object { $_.uid })
+        'datasources = ' + $(if ($uidsDs.Count -gt 0) { $uidsDs -join ', ' } else { '(nenhum)' })
+        $dash = @()
+        try { $dash = @(GrafanaApi '/api/search?query=FCG' | ConvertFrom-Json) } catch { $dash = @() }
+        $uidsDash = @($dash | ForEach-Object { $_.uid })
+        'dashboards encontrados = ' + $(if ($uidsDash.Count -gt 0) { $uidsDash -join ', ' } else { '(nenhum)' })
+        $script:grafanaDatasources = $uidsDs
+        $script:grafanaDashboards = $uidsDash
+    }
+
+    # Os alvos do job fcg-apis no Prometheus, pelo proxy do kubectl (sem port-forward).
+    function ChecarAlvosDoPrometheus() {
+        $alvos = $null
+        try { $alvos = ((kubectl get --raw ('/api/v1/namespaces/' + $namespace + '/services/prometheus:9090/proxy/api/v1/targets') 2>&1) | Out-String | ConvertFrom-Json) } catch { $alvos = $null }
+        if ($alvos) {
+            # O Where-Object nao e enfeite: sem ele, um campo ausente vira @($null), que o PowerShell
+            # conta como UM elemento e faria a checagem passar sem ter lido alvo nenhum.
+            $ativos = @($alvos.data.activeTargets | Where-Object { $_ -ne $null })
+            foreach ($t in $ativos) { '  alvo job=' + $t.labels.job + ' ' + $t.scrapeUrl + ' health=' + $t.health }
+            $fcg = @($ativos | Where-Object { $_.labels.job -eq 'fcg-apis' })
+            Chk ($fcg.Count -eq 3) 'prometheus-tres-alvos-fcg-apis'
+            foreach ($api in @('users-api', 'catalog-api', 'payments-api')) {
+                Chk ([bool](@($fcg | Where-Object { $_.scrapeUrl -match ($api + ':80') -and $_.health -eq 'up' }))) ('prometheus-alvo-' + $api + '-up')
+            }
+            Chk ((@($ativos | Where-Object { $_.health -ne 'up' }).Count) -eq 0) 'prometheus-nenhum-alvo-down'
+        } else {
+            'PROMETHEUS INACESSIVEL pelo proxy do kubectl (get --raw .../services/prometheus:9090/proxy/api/v1/targets)'
+            Chk $false 'prometheus-tres-alvos-fcg-apis'
+        }
+    }
+
+    $token = $null
+    try {
+        if ($Modulo -eq 1) {
+            Step 'MODULO 1 - abertura e arquitetura: a plataforma no ar e o README na mao'
+            # Nao consome nada: so le o cluster e o disco.
+            ChecarPodsDaPlataforma
+            $raizRepo = Split-Path -Parent $PSScriptRoot
+            $caminhoReadme = Join-Path $raizRepo 'README.md'
+            'README da plataforma = ' + $caminhoReadme
+            $temArquitetura = $false
+            $temFluxo = $false
+            if (Test-Path $caminhoReadme) {
+                $temArquitetura = [bool](Select-String -Path $caminhoReadme -Pattern '^## Arquitetura' -Quiet)
+                $temFluxo = [bool](Select-String -Path $caminhoReadme -Pattern '^### Fluxo de eventos' -Quiet)
+            } else {
+                Write-Output 'FALHOU: o README.md do repositorio nao existe: e ele que a abertura mostra (secao Arquitetura).'
+            }
+            'README com a secao Arquitetura = ' + $temArquitetura + '  com o fluxo de eventos = ' + $temFluxo
+            Chk ($temArquitetura -and $temFluxo) 'readme-com-arquitetura-e-fluxo-de-eventos'
+        } elseif ($Modulo -eq 2) {
+            Step 'MODULO 2 - gateway: roteamento e seguranca'
+            ChecarPodsDaPlataforma
+            $s401 = Status ($Gateway + '/api/jogos') 'GET' $null $null
+            'GET /api/jogos sem token = ' + $s401 + '  (esperado 401)'
+            Chk ($s401 -eq '401') 'gateway-401-sem-token'
+            GarantirUsuarioDemo
+            $token = $script:tomadaToken
+            $s200 = Status ($Gateway + '/api/jogos') 'GET' $null $token
+            'GET /api/jogos com token = ' + $s200 + '  (esperado 200)'
+            Chk ($s200 -eq '200') 'gateway-200-com-token'
+            $p8001 = PortaLivre 8001
+            'porta 8001 no host = ' + $(if ($p8001) { 'livre' } else { 'OCUPADA' }) + '  (o port-forward da Admin API e desta tomada)'
+            Chk $p8001 'porta-8001-livre-no-host'
+            if (-not $p8001) {
+                Write-Output 'a porta 8001 ja esta em uso: feche o port-forward que esta nela (Ctrl+C na janela dele) e'
+                Write-Output 'rode o preparo do modulo 2 de novo -- o port-forward da Admin API e DESTA tomada.'
+            }
+            # A Admin API escuta SO no loopback do pod e nao e publicada no Service: sem port-forward, o
+            # unico jeito de provar o roteamento declarado e ler a config DB-less do Secret (em memoria).
+            # So o resumo -- nomes de servico e de rota, e a presenca do plugin -- e impresso; o segredo
+            # HMAC do consumer vai para a lista do San() e NUNCA aparece na saida.
+            $configKong = SecretValor 'kong-declarative-config' 'kong.yml'
+            if ($configKong) {
+                $segredosKong = [regex]::Matches($configKong, '(?m)^\s*secret:\s*"?([^"\r\n]+)"?\s*$')
+                foreach ($m in $segredosKong) { $script:segredos += $m.Groups[1].Value.Trim() }
+                $servicosKong = @([regex]::Matches($configKong, '(?m)^  - name: (\S+)') | ForEach-Object { $_.Groups[1].Value })
+                $rotasKong = @([regex]::Matches($configKong, '(?m)^      - name: (\S+)') | ForEach-Object { $_.Groups[1].Value })
+                'config do Kong lida do Secret kong-declarative-config (so o resumo: nenhum segredo e impresso)'
+                'servicos no Kong = ' + $(if ($servicosKong.Count -gt 0) { $servicosKong -join ', ' } else { '(nenhum)' })
+                'rotas no Kong = ' + $(if ($rotasKong.Count -gt 0) { $rotasKong -join ', ' } else { '(nenhum)' })
+                # Roteamento: quem expoe as APIs e o Kong. O payments-api NAO tem rota (ele e consumidor de
+                # fila) -- e essa ausencia e a evidencia de arquitetura que a tomada narra.
+                Chk (($rotasKong.Count -ge 1) -and ($configKong -notmatch 'payments-api')) 'kong-sem-rota-para-payments-api'
+                # Seguranca: as rotas protegidas levam o plugin jwt (sem ele o 401 sem token nao existiria).
+                Chk ($configKong -match '(?m)^\s*- name: jwt') 'kong-com-plugin-jwt'
+            } else {
+                Write-Output 'FALHOU: nao consegui ler o Secret kong-declarative-config/kong.yml (rode o'
+                Write-Output 'FALHOU: scripts/deploy-kong.ps1): sem ele nao da para provar o roteamento antes de gravar.'
+                Chk $false 'kong-sem-rota-para-payments-api'
+                Chk $false 'kong-com-plugin-jwt'
+            }
+        } elseif ($Modulo -eq 3) {
+            Step 'MODULO 3 - funcao serverless: escala a zero, filas e log na plataforma'
+            ChecarPodsDaPlataforma
+            ChecarKedaEFilas
+            ChecarLokiELogDaFuncao
+            GrafanaAberto
+            Chk (($script:grafanaDatasources) -contains 'loki') 'grafana-datasource-loki'
+            Chk (($script:grafanaDashboards) -contains 'fcg-logs') 'grafana-dashboard-fcg-logs'
+            $p13000 = PortaLivre 13000
+            'porta 13000 no host = ' + $(if ($p13000) { 'livre' } else { 'OCUPADA' }) + '  (o port-forward do Grafana e desta tomada)'
+            Chk $p13000 'porta-13000-livre-no-host'
+            if (-not $p13000) {
+                Write-Output 'a porta 13000 ja esta em uso: feche o port-forward do Grafana da tomada anterior (Ctrl+C)'
+                Write-Output 'e rode o preparo do modulo 3 de novo.'
+            }
+            # POR ULTIMO a espera da escala a zero: e o estado com que a tomada comeca (o 0/0 na tela) e
+            # nada depois daqui acorda a funcao. O KEDA tem cooldownPeriod de 30s e o pod ainda precisa
+            # terminar; 120s e o limite -- se estourar, espere um pouco mais e rode o preparo de novo.
+            $t0 = Get-Date
+            $zero = $false
+            while (((Get-Date) - $t0).TotalSeconds -lt 120) {
+                $podsFn = @(Pods 'app=notifications-function')
+                $repFn = ((kubectl get -n $namespace deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
+                if (($podsFn.Count -eq 0) -and ($repFn -eq '0')) { $zero = $true; break }
+                '  aguardando o cooldown do KEDA (30s) + o termino do pod... pods=' + $podsFn.Count + ' replicas=' + $repFn
+                Start-Sleep -Seconds 10
+            }
+            $podsFn = @(Pods 'app=notifications-function')
+            $repFn = ((kubectl get -n $namespace deployment notifications-function -o jsonpath='{.spec.replicas}' 2>&1) | Out-String).Trim()
+            'deployment notifications-function: replicas=' + $repFn + '  pods=' + $podsFn.Count + '  (esperado 0 e 0)'
+            'kubectl get -n default pods -l app=notifications-function = ' + $(if ($podsFn.Count -eq 0) { 'No resources found' } else { ($podsFn -join ' | ') })
+            Chk $zero 'funcao-em-zero-replicas-estado-inicial'
+            if (-not $zero) {
+                Write-Output 'a funcao NAO voltou a zero em 120s: espere o cooldown de 30s mais o termino do pod e rode'
+                Write-Output 'o preparo do modulo 3 de novo -- a tomada precisa COMECAR com o 0/0 na tela.'
+            }
+        } elseif ($Modulo -eq 4) {
+            Step 'MODULO 4 - observabilidade: trafego, paineis e o pagamento por evento'
+            foreach ($porta in @(13000, 19090)) {
+                $livre = PortaLivre $porta
+                'porta ' + $porta + ' no host = ' + $(if ($livre) { 'livre' } else { 'OCUPADA' }) + '  (o port-forward da tomada precisa dela)'
+                Chk $livre ('porta-' + $porta + '-livre-no-host')
+            }
+            ChecarAlvosDoPrometheus
+            GrafanaAberto
+            Chk (($script:grafanaDatasources) -contains 'prometheus') 'grafana-datasource-prometheus'
+            Chk (($script:grafanaDashboards) -contains 'fcg-apis') 'grafana-dashboard-fcg-apis'
+            GarantirUsuarioDemo
+            $token = $script:tomadaToken
+            GarantirJogoLivre
+            $jogoDaTomada = $script:tomadaJogoId
+            $jogoDaTomadaNome = $script:tomadaJogoNome
+            # O CONTADOR DE PAGAMENTOS: no prometheus-net 8.2.1 a familia com labels so nasce no primeiro
+            # WithLabels, ou seja, depois que o consumidor processa o primeiro OrderPlacedEvent. Num
+            # cluster frio ele nao existe e o painel "Pagamentos processados por status" ficaria sem serie
+            # na tomada: a compra de verificacao aqui -- em OUTRO jogo LIVRE, nunca no da tomada, que
+            # precisa da PRIMEIRA compra daquele par para mover o painel -- cria a familia.
+            $mPayments = Metricas 'payments-api:80'
+            $temContador = [bool]($mPayments -match '(?m)^fcg_payments_processados_total')
+            $alternativo = $null
+            $compraOk = $false
+            if (-not $temContador) {
+                for ($i = $script:tomadaJogos.Count - 1; $i -ge 0; $i--) {
+                    $idCand = [string]$script:tomadaJogos[$i].id
+                    if ($idCand -and ($idCand -ne $jogoDaTomada) -and ($script:tomadaBiblioteca -notcontains $idCand.ToLower())) { $alternativo = $idCand; break }
+                }
+                if ($alternativo) {
+                    $userId = Claim $token 'Id'
+                    $bCompra = Body 'compra.json' ('{"userId":"' + $userId + '","gameId":"' + $alternativo + '"}')
+                    $rCompra = Resposta ($Gateway + '/api/jogos/' + $alternativo + '/comprar') 'POST' $bCompra $token
+                    'compra de verificacao (jogo ' + $alternativo + ', OUTRO que o da tomada) = ' + $rCompra.Code + '  (esperado 202)'
+                    $compraOk = ($rCompra.Code -eq '202')
+                    if ($compraOk) {
+                        for ($k = 1; $k -le 6; $k++) {
+                            Start-Sleep -Seconds 5
+                            $mPayments = Metricas 'payments-api:80'
+                            if ($mPayments -match '(?m)^fcg_payments_processados_total') { $temContador = $true; break }
+                        }
+                        Chk ($rCompra.Code -eq '202') 'compra-aceita-202'
+                    } elseif (@('400', '409') -contains $rCompra.Code) {
+                        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' (o usuario demo ja possui')
+                        Write-Output 'ATENCAO: ESTE jogo). O jogo da tomada NAO e afetado (foi escolhido por estar livre) e o'
+                        Write-Output 'ATENCAO: que se perde e a prova do 202 e do contador nesta rodada.'
+                        Write-Output '(esta situacao NAO entra na contagem de checagens: e re-execucao, nao falha)'
+                    } else {
+                        Write-Output ('FALHOU: a compra de verificacao devolveu ' + $rCompra.Code + ' -- isso NAO e re-execucao (400/409):')
+                        Write-Output 'FALHOU: o endpoint POST /api/jogos/{id}/comprar nao esta respondendo como esperado'
+                        Write-Output 'FALHOU: (401 = token recusado, 403 = sem permissao, 5xx/000 = servico ou gateway fora).'
+                        Chk $false 'compra-aceita-202'
+                    }
+                } else {
+                    Write-Output 'ATENCAO: nao ha outro jogo LIVRE no catalogo para a compra de verificacao (o jogo da'
+                    Write-Output 'ATENCAO: tomada nao pode ser consumido aqui) e o contador ainda nao esta no /metrics.'
+                    Write-Output '(esta situacao NAO entra na contagem de checagens: a compra DA TOMADA cria a familia)'
+                }
+            }
+            'contador fcg_payments_processados_total no /metrics do payments-api = ' + $temContador
+            if ($temContador) {
+                Chk $temContador 'metrics-payments-api-contador-de-negocio'
+            } elseif ($compraOk) {
+                Write-Output 'FALHOU: a compra de verificacao foi ACEITA (202) e publicou o OrderPlacedEvent, mas o contador'
+                Write-Output 'FALHOU: fcg_payments_processados_total nao apareceu no /metrics do payments-api nem depois'
+                Write-Output 'FALHOU: de 30s: o painel "Pagamentos processados por status" ficaria sem serie na tomada.'
+                Chk $false 'metrics-payments-api-contador-de-negocio'
+            }
+            if ($jogoDaTomada) {
+                'jogo do modulo 4 (compra) = ' + $jogoDaTomadaNome + ' (' + $jogoDaTomada + ')'
+                '  (nenhum outro jogo foi comprado aqui: a primeira compra DESTE par e a que move o painel na tomada)'
+            }
+        } elseif ($Modulo -eq 5) {
+            Step 'MODULO 5 - NoSQL e cache: avaliacoes no Mongo e o Redis como cache de leitura'
+            GarantirUsuarioDemo
+            $token = $script:tomadaToken
+            # O JOGO DA TOMADA: o mesmo id que o modulo 4 comprou ($env:FCG_DEMO_JOGO), se ele existir no
+            # catalogo. Depois de gravar o modulo 4 esse jogo JA pertence ao usuario demo -- a avaliacao e
+            # upsert por (gameId, userId) e NAO precisa de jogo livre. Se a variavel nao estiver definida
+            # (tomada do modulo 5 gravada antes da do 4), o preparo reelege um jogo livre e imprime o id.
+            # O catalogo e lido UMA vez em cada caminho (o id pedido se valida aqui; a eleicao le sozinha).
+            $pedido = [string]$env:FCG_DEMO_JOGO
+            $jogoDaTomada = ''
+            $jogoDaTomadaNome = ''
+            if ($pedido) {
+                $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
+                $jogos = @($lista.Body | Where-Object { $_ -ne $null })
+                'GET /api/jogos = ' + $lista.Code + '  jogos no catalogo = ' + $jogos.Count
+                Chk ($lista.Code -eq '200' -and $lista.ParseOk) 'catalogo-listagem-200'
+                if ($lista.ParseOk) {
+                    $achado = @($jogos | Where-Object { ([string]$_.id).ToLower() -eq $pedido.ToLower() })
+                    if ($achado.Count -ge 1) {
+                        $jogoDaTomada = [string]$achado[0].id
+                        $jogoDaTomadaNome = [string]$achado[0].nome
+                    }
+                }
+            }
+            if ($jogoDaTomada) {
+                'jogo da tomada = ' + $jogoDaTomadaNome + ' (' + $jogoDaTomada + ')  -- veio de FCG_DEMO_JOGO'
+            } else {
+                if ($pedido) {
+                    'FCG_DEMO_JOGO = ' + $pedido + ' nao esta no catalogo: reelegendo um jogo livre e imprimindo o id'
+                } else {
+                    'FCG_DEMO_JOGO nao esta definido nesta sessao: reelegendo um jogo livre e imprimindo o id'
+                }
+                GarantirJogoLivre
+                $jogoDaTomada = $script:tomadaJogoId
+                $jogoDaTomadaNome = $script:tomadaJogoNome
+            }
+            Chk ([bool]$jogoDaTomada) 'jogo-da-tomada-definido'
+            if ($jogoDaTomada) {
+                # O PUT e upsert por (gameId, userId): 201 na primeira avaliacao e 200 ao atualizar. Como
+                # ESTE preparo ja gravou a avaliacao do demo neste jogo, na gravacao o PUT devolve 200.
+                $bAval = Body 'avaliacao.json' '{"nota":5,"comentario":"Jogo muito bom","tags":["acao","video"]}'
+                $rAval = Resposta ($Gateway + '/api/jogos/' + $jogoDaTomada + '/avaliacoes') 'PUT' $bAval $token
+                'PUT /api/jogos/{id}/avaliacoes = ' + $rAval.Code + '  (esperado 201 na primeira, 200 na atualizacao)'
+                Chk (@('200', '201') -contains $rAval.Code) 'avaliacao-upsert-200-ou-201'
+                $rListaAval = Resposta ($Gateway + '/api/jogos/' + $jogoDaTomada + '/avaliacoes') 'GET' $null $token
+                'GET /api/jogos/{id}/avaliacoes = ' + $rListaAval.Code + '  (esperado 200: a lista vem do Mongo)'
+                Chk ($rListaAval.Code -eq '200') 'avaliacao-listagem-200'
+            } else {
+                'sem jogo da tomada: a avaliacao do modulo 5 nao pode ser exercitada'
+                Chk $false 'avaliacao-upsert-200-ou-201'
+                Chk $false 'avaliacao-listagem-200'
+            }
+            # O TTL da chave e de 60s: a listagem e lida IMEDIATAMENTE antes de olhar o Redis.
+            $sLista = Status ($Gateway + '/api/jogos') 'GET' $null $token
+            $chaves = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli keys 'catalog:*' 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+            'GET /api/jogos (aquece o cache) = ' + $sLista
+            'redis-cli keys catalog:* = ' + $(if ($chaves) { $chaves } else { '(vazio)' })
+            Chk ($chaves -match 'catalog:') 'redis-com-chaves-catalog'
+            $tipo = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli type catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+            $ttl = (San (((kubectl exec -n $namespace deploy/redis -- redis-cli ttl catalog:games:all 2>&1) | ForEach-Object { [string]$_ }) -join ' ')).Trim()
+            'redis-cli type/ttl catalog:games:all = ' + $tipo + ' / ' + $ttl + '  (esperado hash / ate 60)'
+            $mCatalog = Metricas 'catalog-api:80'
+            Chk ($mCatalog -match '(?m)^cache_hit') 'metrics-catalog-api-cache-hit'
+            Chk ($mCatalog -match '(?m)^cache_miss') 'metrics-catalog-api-cache-miss'
+        } elseif ($Modulo -eq 6) {
+            Step 'MODULO 6 - repositorios e fechamento'
+            $raizRepo = Split-Path -Parent $PSScriptRoot
+            $paiDosRepos = Split-Path -Parent $raizRepo
+            'repositorios locais = ' + $paiDosRepos
+            # 1) Os 5 repositorios da tabela do README sem alteracao pendente (nada de arquivo modificado
+            #    aparecendo na tela). Arquivo NAO RASTREADO nao e alteracao pendente: sai como ATENCAO.
+            foreach ($repo in @('fcg-orchestration', 'fcg-users-api', 'fcg-catalog-api', 'fcg-payments-api', 'fcg-notifications-function')) {
+                $caminho = Join-Path $paiDosRepos $repo
+                $rotulo = 'repo-' + $repo + '-sem-alteracoes-pendentes'
+                if (-not (Test-Path $caminho)) {
+                    Write-Output ('FALHOU: o repositorio local ' + $caminho + ' nao existe -- a tabela do video cita os 5.')
+                    Chk $false $rotulo
+                    continue
+                }
+                $linhas = @(git -C $caminho status --porcelain 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_ -match '\S' })
+                $modificados = @($linhas | Where-Object { $_ -notmatch '^\?\?' })
+                $naoRastreados = @($linhas | Where-Object { $_ -match '^\?\?' })
+                'git status em ' + $repo + ' = ' + $(if ($linhas.Count -eq 0) { '(limpo)' } else { $modificados.Count.ToString() + ' com alteracao, ' + $naoRastreados.Count.ToString() + ' nao rastreado(s)' })
+                if ($modificados.Count -gt 0) {
+                    $modificados | Select-Object -First 8 | ForEach-Object { '  ' + $_ }
+                }
+                Chk ($modificados.Count -eq 0) $rotulo
+                if (($naoRastreados.Count -gt 0) -and ($modificados.Count -eq 0)) {
+                    Write-Output 'ATENCAO: ha arquivo NAO RASTREADO nesse repositorio (nao e alteracao pendente, mas aparece'
+                    Write-Output 'ATENCAO: num git status na tela): confira antes de gravar.'
+                    Write-Output '(esta situacao NAO entra na contagem de checagens: nao e alteracao pendente)'
+                }
+            }
+            # 2) A evidencia de segredos do README (varios -e, nunca -E com alternancia e pipe escapado --
+            #    dentro de tabela Markdown o \| e pipe LITERAL no regex do -E e a prova sairia vazia mesmo
+            #    com vazamento). Os padroes sao montados por concatenacao de proposito: escritos inteiros
+            #    aqui, ESTE arquivo seria encontrado pela propria evidencia. O resultado nunca e impresso
+            #    linha a linha -- so a contagem, porque uma linha encontrada E um segredo.
+            $argsGrep = @('-n', '-E')
+            foreach ($padrao in @(('Password=' + 'FCG@'), ('Fcg2024' + 'Test!'), ('fcg-secret-key' + '-2024'))) { $argsGrep += @('-e', $padrao) }
+            $argsGrep += @('--', '.', ':!README.md')
+            $evidencia = @(git -C $raizRepo grep @argsGrep 2>&1 | ForEach-Object { [string]$_ } | Where-Object { $_ -match '\S' })
+            'evidencia de segredos (a mesma do README, com varios -e) = ' + $(if ($evidencia.Count -eq 0) { '(vazio: nenhuma credencial versionada)' } else { ($evidencia.Count.ToString() + ' linha(s) encontrada(s)') })
+            Chk ($evidencia.Count -eq 0) 'evidencia-de-segredos-vazia'
+            if ($evidencia.Count -gt 0) {
+                Write-Output 'NAO GRAVE: a evidencia nao esta vazia. As linhas NAO sao impressas de proposito (uma linha'
+                Write-Output 'encontrada aqui E a propria credencial): rode o mesmo git grep na sua maquina e corrija.'
+            }
+            # 3) O README que a tomada mostra: a tabela dos 5 repositorios (com o link da funcao) e a secao
+            #    que mapeia requisito -> onde esta -> como comprovar.
+            $caminhoReadme = Join-Path $raizRepo 'README.md'
+            $temLinkFuncao = $false
+            $temSecaoRequisitos = $false
+            if (Test-Path $caminhoReadme) {
+                $temLinkFuncao = [bool](Select-String -Path $caminhoReadme -Pattern 'gustavoaa-dev/fcg-notifications-function' -SimpleMatch -Quiet)
+                $temSecaoRequisitos = [bool](Select-String -Path $caminhoReadme -Pattern '^## Atendimento dos requisitos da Fase 3' -Quiet)
+            } else {
+                Write-Output ('FALHOU: nao encontrei ' + $caminhoReadme + ' (e ele que a tomada mostra).')
+            }
+            'README com o link da funcao = ' + $temLinkFuncao + '  com a secao de requisitos = ' + $temSecaoRequisitos
+            Chk $temLinkFuncao 'readme-com-link-do-repositorio-da-funcao'
+            Chk $temSecaoRequisitos 'readme-com-secao-de-requisitos-da-fase-3'
+        }
+    } catch {
+        Write-Output ''
+        Write-Output ('ERRO NAO TRATADO: ' + (San $_.Exception.Message))
+        Write-Output (San $_.ScriptStackTrace)
+        $script:falhas++
+    } finally {
+
+        Step 'RESULTADO'
+        'modulo=' + $Modulo + '  checagens=' + $script:checagens + '  falhas=' + $script:falhas
+        if ($script:falhas -gt 0) {
+            Write-Output ('PREFLIGHT REPROVADO: ' + $script:falhas + ' checagem(ns) falhou(aram) -- leia as linhas [FALHOU] acima.')
+            Write-Output ('NAO GRAVE ainda o modulo ' + $Modulo + ': qualquer falha aqui aparece no video como um bloco sem evidencia.')
+        } else {
+            Write-Output ('TUDO PRONTO PARA GRAVAR O MODULO ' + $Modulo)
+            if ($Modulo -eq 1) {
+                Write-Output '  abra o README.md na secao Arquitetura (tabela de servicos + fluxo de eventos): e a tela da abertura'
+                Write-Output '  nenhum recurso do cluster foi consumido por este preparo'
+            } elseif ($Modulo -eq 2) {
+                Write-Output ('  usuario de demonstracao: ' + $Email + ' (senha em FCG_DEMO_SENHA; a tomada faz login com ele)')
+                Write-Output '  a Admin API (porta 8001) e DESTA tomada: suba o port-forward no T3 e feche-o ao terminar'
+            } elseif ($Modulo -eq 3) {
+                Write-Output ('  funcao de notificacoes: ' + $repFn + ' replicas e ' + $podsFn.Count + ' pod(s) -- a tomada comeca com o 0/0 na tela')
+                Write-Output '  o cadastro da tomada sobe o pod em ~15-30s (pollingInterval de 15s; medido 20-31s)'
+                Write-Output '  painel da tomada: Grafana > Dashboards > FCG - Logs (Loki), com o periodo Last 5 minutes'
+            } elseif ($Modulo -eq 4) {
+                if ($jogoDaTomada) {
+                    Write-Output ('  jogo do modulo 4 (compra) = ' + $jogoDaTomadaNome + ' (' + $jogoDaTomada + ')')
+                    Write-Output ("  copie para a sessao da tomada: `$env:FCG_DEMO_JOGO = '" + $jogoDaTomada + "'")
+                }
+                Write-Output '  painel da tomada: dashboard FCG - APIs em tela cheia + Status > Targets no Prometheus'
+            } elseif ($Modulo -eq 5) {
+                if ($jogoDaTomada) {
+                    Write-Output ('  jogo do modulo 5 (avaliacoes) = ' + $jogoDaTomadaNome + ' (' + $jogoDaTomada + ')')
+                    Write-Output ("  copie para a sessao da tomada: `$env:FCG_DEMO_JOGO = '" + $jogoDaTomada + "'")
+                }
+                Write-Output '  o PUT da tomada devolve 200 (upsert): este preparo ja gravou a avaliacao do demo neste jogo'
+            } elseif ($Modulo -eq 6) {
+                Write-Output '  os 5 repositorios locais estao sem alteracao pendente e a evidencia de segredos devolve vazio'
+                Write-Output '  README com a tabela dos repositorios e a secao Atendimento dos requisitos da Fase 3'
+            }
+            Write-Output '  roteiro: docs/roteiro-video-fase3.md'
+        }
+        # O temporario guarda o corpo do login/cadastro com a senha da demo em claro: apagar SEMPRE.
+        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+        'ambiente temporario removido'
+    }
+
+    exit $(if ($script:falhas -gt 0) { 1 } else { 0 })
+}
 
 $token = $null
 try {
