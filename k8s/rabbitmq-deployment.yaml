@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-data
+  labels:
+    app: rabbitmq
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +20,9 @@ metadata:
     app: rabbitmq
 spec:
   replicas: 1
+  # O PVC e ReadWriteOnce: num rolling update o pod novo ficaria preso esperando o volume.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: rabbitmq
@@ -31,6 +48,23 @@ spec:
               value: "guest"
             - name: RABBITMQ_DEFAULT_PASS
               value: "guest"
+            # Sem isto o nome do no e derivado do nome do POD (rabbit@rabbitmq-<hash>-<id>): ao recriar
+            # o pod o broker inicia um no novo e "perde" as definicoes, mesmo com o volume intacto
+            # (o mnesia fica em /var/lib/rabbitmq/mnesia/rabbit@<nome-do-no>). Nome fixo mantem o
+            # diretorio estavel entre recriacoes. No unico com distribuicao em loopback: os clientes
+            # falam AMQP pelo Service, nao pelo nome de no.
+            - name: RABBITMQ_NODENAME
+              value: "rabbit@localhost"
+          # Estado do broker em volume: o mnesia/ abaixo de /var/lib/rabbitmq (o RABBITMQ_MNESIA_BASE).
+          # Sem fsGroup de proposito -- o entrypoint inicia como root, faz o chown do diretorio para
+          # o usuario rabbitmq e so entao desce privilegio com gosu.
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/rabbitmq
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: rabbitmq-data
 ---
 apiVersion: v1
 kind: Service

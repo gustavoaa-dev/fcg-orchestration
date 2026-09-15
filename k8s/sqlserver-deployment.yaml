@@ -1,3 +1,17 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: sqlserver-data
+  labels:
+    app: sqlserver
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +20,9 @@ metadata:
     app: sqlserver
 spec:
   replicas: 1
+  # O PVC e ReadWriteOnce: num rolling update o pod novo ficaria preso esperando o volume.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: sqlserver
@@ -14,6 +31,9 @@ spec:
       labels:
         app: sqlserver
     spec:
+      # A imagem do mssql roda como uid 10001: sem fsGroup o volume novo vem root e o SQL Server nao sobe.
+      securityContext:
+        fsGroup: 10001
       containers:
         - name: sqlserver
           image: mcr.microsoft.com/mssql/server:2022-latest
@@ -33,6 +53,15 @@ spec:
                 secretKeyRef:
                   name: sqlserver-secret
                   key: sa-password
+          # Estado do banco (usuarios, jogos e biblioteca) mora em volume: o filesystem do
+          # container e descartado sempre que o pod e recriado.
+          volumeMounts:
+            - name: data
+              mountPath: /var/opt/mssql
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: sqlserver-data
 ---
 apiVersion: v1
 kind: Service
