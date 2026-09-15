@@ -25,9 +25,12 @@
 #       $SA_PASSWORD do ambiente do container) e CONFERE o Role lido do banco depois do UPDATE, porque
 #       o login responde 200 com qualquer role e um UPDATE sem efeito so apareceria no POST de jogo.
 #       Depois refaz o login, cria os jogos que faltam, le a biblioteca do usuario
-#       (GET /api/biblioteca/{userId}) e escolhe o JOGO DO BLOCO 4: o primeiro do catalogo que o
-#       usuario ainda NAO possui (o catalogo volta ordenado por nome e a biblioteca cresce a cada
-#       rodada -- "o primeiro id do catalogo" daria 400 na compra do video)
+#       (GET /api/biblioteca/{userId} -- o id dos itens vem no campo "gameId", medido no cluster) e
+#       escolhe o JOGO DO BLOCO 4: o primeiro do catalogo que o usuario ainda NAO possui (o catalogo
+#       volta ordenado por nome e a biblioteca cresce a cada rodada -- "o primeiro id do catalogo"
+#       daria 400 na compra do video). Se todos os jogos do catalogo ja forem dele, o preflight CRIA
+#       mais um jogo e REAVALIA a escolha; a checagem do bloco 4 e um predicado real (existe no
+#       catalogo E nao esta na biblioteca lida)
 #   P10 Redis com as chaves catalog:* e o Mongo respondendo (GET .../avaliacoes = 200)
 #   P10b os comandos que SO aparecem no video sao exercitados aqui: as series dos paineis em
 #       /metrics (proxy do kubectl, sem port-forward), a compra de verificacao -- que usa OUTRO jogo,
@@ -36,13 +39,14 @@
 #       200 na 2a) no jogo do bloco 4
 #   P11 FUNCAO EM 0 REPLICAS (estado inicial da demo), esperando o cooldown do KEDA se preciso
 #
-# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os TRES casos de ATENCAO
-# (log da funcao ainda ausente no Loki, compra devolvendo 400/409 por posse, biblioteca devolvendo 404
-# por ainda nao existir) sao VARIACAO LEGITIMA DE ESTADO: NAO emitem [OK] e NAO incrementam o contador.
-# Todo o resto reprova -- generalizar "!= 202" ou "!= 200" para ATENCAO engoliria justamente os
-# codigos que denunciam um endpoint quebrado. O total varia de 48 a 54: 51 no caminho ideal, +3 se o
+# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os casos de ATENCAO
+# (log da funcao ainda ausente no Loki; compra devolvendo 400/409 por posse; biblioteca devolvendo 404
+# por ainda nao existir -- que tambem tira a checagem do jogo do bloco 4, porque sem a lista lida a
+# posse nao pode ser verificada) sao VARIACAO LEGITIMA DE ESTADO: NAO emitem [OK] e NAO incrementam o
+# contador. Todo o resto reprova -- generalizar "!= 202" ou "!= 200" para ATENCAO engoliria justamente
+# os codigos que denunciam um endpoint quebrado. O total varia de 47 a 54: 51 no caminho ideal, +3 se o
 # preflight precisar promover o usuario a Admin (secret, login e o Role lido do banco), e -1 por cada
-# ATENCAO (ver a tabela de cenarios no relatorio).
+# ATENCAO (-2 quando a biblioteca nao e lida: a checagem dela e a do jogo do bloco 4).
 #
 # Nada de port-forward: o Prometheus e o Loki sao alcancados pelo proxy do kubectl
 # (kubectl get --raw .../services/<svc>:<porta>/proxy/...) e o Grafana por kubectl exec + wget.
@@ -179,23 +183,48 @@ function Claim($token, $nome) {
     switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
     try { return (([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).$nome) } catch { return $null }
 }
-# Ids dos jogos que o usuario tem na biblioteca: a resposta pode ser a lista direta ou vir dentro de
-# um envelope ({ "itens": [...] } / { "jogos": [...] }), e cada item pode trazer o id em "id",
-# "jogoId" ou "jogo.id". A comparacao com o catalogo e feita em minusculas (Guid nao tem caixa fixa).
+# Ids dos jogos que o usuario tem na biblioteca. A resposta medida no cluster e uma LISTA DIRETA de
+# itens com o id no campo "gameId":
+#   [{"gameId":"7ed3f967-...","nome":"Elden Ring","descricao":"...","preco":199.90,"dataCompra":"..."}, ...]
+# (o defeito da rodada 2 foi justamente este: o extrator procurava "id"/"jogoId" e devolvia ZERO ids,
+# entao a biblioteca parecia vazia e o jogo do bloco 4 era escolhido no escuro.)
+# O extrator aceita: "gameId", "id", "jogoId", "game_id" e os aninhados "jogo.id"/"game.id", em
+# QUALQUER caixa (a comparacao de NOME e feita com ToLower, sem depender do indexador do PSObject), e
+# tambem uma lista de ids puros (["guid", "guid"]). Quando nada e reconhecido numa resposta com itens,
+# preenche $script:camposBiblioteca com os nomes de campo encontrados -- o chamador imprime isso, para
+# a proxima divergencia de contrato aparecer na hora em vez de virar uma escolha silenciosamente errada.
 function IdsDaBiblioteca($corpo) {
+    $script:camposBiblioteca = ''
     if (-not $corpo) { return @() }
     $lista = $corpo
     foreach ($prop in @('itens', 'jogos', 'biblioteca', 'items')) {
         $p = $corpo.PSObject.Properties[$prop]
         if ($p -and $p.Value) { $lista = $p.Value; break }
     }
+    $itens = @($lista | Where-Object { $_ -ne $null })
     $ids = @()
-    foreach ($item in @($lista | Where-Object { $_ -ne $null })) {
+    foreach ($item in $itens) {
+        if ($item -is [string]) { $ids += $item; continue }
+        $props = @($item.PSObject.Properties)
         $id = $null
-        if ($item.id) { $id = $item.id }
-        elseif ($item.jogoId) { $id = $item.jogoId }
-        elseif ($item.jogo -and $item.jogo.id) { $id = $item.jogo.id }
+        foreach ($chave in @('gameid', 'id', 'jogoid', 'game_id', 'jogo_id')) {
+            $pr = @($props | Where-Object { $_.Name.ToLower() -eq $chave } | Select-Object -First 1)
+            if ($pr.Count -gt 0 -and $pr[0].Value) { $id = $pr[0].Value; break }
+        }
+        if (-not $id) {
+            foreach ($aninhado in @('jogo', 'game')) {
+                $pr = @($props | Where-Object { $_.Name.ToLower() -eq $aninhado } | Select-Object -First 1)
+                if ($pr.Count -gt 0 -and $pr[0].Value) {
+                    $sub = @($pr[0].Value.PSObject.Properties | Where-Object { $_.Name.ToLower() -eq 'id' } | Select-Object -First 1)
+                    if ($sub.Count -gt 0 -and $sub[0].Value) { $id = $sub[0].Value; break }
+                }
+            }
+        }
         if ($id) { $ids += [string]$id }
+    }
+    # Diagnostico: itens existem, mas nenhum id reconhecido -> mostra os campos do primeiro item.
+    if (($ids.Count -eq 0) -and ($itens.Count -gt 0) -and ($itens[0] -isnot [string])) {
+        $script:camposBiblioteca = (@($itens[0].PSObject.Properties | ForEach-Object { $_.Name }) -join ', ')
     }
     return $ids
 }
@@ -452,7 +481,20 @@ $bibliotecaVazia = ($bib.Code -eq '404')
 if ($bibliotecaLida) {
     Chk $bibliotecaLida 'biblioteca-do-usuario-200'
     $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
-    'biblioteca do usuario demo = ' + $idsBiblioteca.Count + ' jogo(s): ' + $(if ($idsBiblioteca.Count -gt 0) { $idsBiblioteca -join ', ' } else { '(vazia)' })
+    if ($idsBiblioteca.Count -gt 0) {
+        'biblioteca do usuario demo = ' + $idsBiblioteca.Count + ' jogo(s): ' + ($idsBiblioteca -join ', ')
+    } else {
+        'biblioteca do usuario demo = 0 jogo(s) reconhecido(s)'
+        # Diagnostico de contrato: mostra os campos que o item REALMENTE tem. Sem isto, um campo com
+        # nome diferente do esperado vira uma biblioteca "vazia" e a escolha do bloco 4 sai errada --
+        # foi exatamente o defeito da rodada 2 (o campo e "gameId").
+        if ($script:camposBiblioteca) {
+            'campos do item da biblioteca: ' + $script:camposBiblioteca
+            Write-Output 'ATENCAO: a biblioteca respondeu 200 e tem itens, mas nenhum id foi reconhecido'
+            Write-Output ('ATENCAO: nos campos acima. O contrato medido no cluster usa "gameId". Se a lista')
+            Write-Output 'ATENCAO: de verdade estiver vazia, ignore; se nao estiver, a escolha abaixo mente.'
+        }
+    }
 } elseif ($bibliotecaVazia) {
     Write-Output 'ATENCAO: GET /api/biblioteca/{userId} respondeu 404: o usuario de demonstracao ainda nao'
     Write-Output 'ATENCAO: tem biblioteca (nada possuido), entao a escolha abaixo cai no PRIMEIRO jogo do'
@@ -508,7 +550,40 @@ while ((-not $jogoDemo) -and ($tentativaLivre -lt 3)) {
     }
 }
 'jogo do bloco 4 (compra) = ' + $jogoDemoNome + ' (' + $jogoDemo + ')'
-Chk ([bool]$jogoDemo) 'jogo-do-bloco-4-escolhido'
+
+# A checagem do jogo do bloco 4 e um PREDICADO REAL (o defeito da rodada 2 aprovou uma escolha errada
+# -- mesma classe do [OK] constante que a rodada 1 mandou eliminar): o id escolhido tem de EXISTIR no
+# catalogo e NAO estar na biblioteca LIDA. Se a biblioteca nao pode ser lida (Code != 200), nao ha como
+# garantir a segunda metade: sai ATENCAO e a checagem NAO e contada (e, se o codigo foi diferente de
+# 404, a checagem da biblioteca acima ja reprovou o preflight).
+$idsCatalogo = @($jogos | ForEach-Object { ([string]$_.id).ToLower() })
+$idEscolhido = ''
+if ($jogoDemo) { $idEscolhido = ([string]$jogoDemo).ToLower() }
+$existeNoCatalogo = [bool]($idEscolhido -and ($idsCatalogo -contains $idEscolhido))
+if ($bibliotecaLida) {
+    $estaNaBiblioteca = ($idsBiblioteca -contains $idEscolhido)
+    $jogoLivre = [bool]($existeNoCatalogo -and (-not $estaNaBiblioteca))
+    if ($estaNaBiblioteca) {
+        Write-Output ('FALHOU: o jogo escolhido para o bloco 4 (' + $jogoDemo + ') ESTA na biblioteca do usuario')
+        Write-Output 'FALHOU: demo -- a compra do video responderia 400. A escolha (primeiro do catalogo que'
+        Write-Output 'FALHOU: ele nao possui) falhou: confira o extrator de ids da biblioteca acima.'
+    }
+    if (-not $existeNoCatalogo) {
+        Write-Output ('FALHOU: o jogo escolhido (' + $jogoDemo + ') nao esta na lista do catalogo lida.')
+    }
+    'jogo do bloco 4 livre = ' + $jogoLivre + '  (existe no catalogo=' + $existeNoCatalogo + '  esta na biblioteca=' + $estaNaBiblioteca + ')'
+    Chk $jogoLivre 'jogo-do-bloco-4-escolhido'
+} else {
+    if ($existeNoCatalogo) {
+        Write-Output 'ATENCAO: sem a biblioteca lida nao da para garantir que o jogo escolhido esta livre'
+        Write-Output ('ATENCAO: (ele existe no catalogo=' + $existeNoCatalogo + ', mas a posse nao foi verificada).')
+        Write-Output '(esta situacao NAO entra na contagem de checagens: a posse nao pode ser verificada)'
+    } else {
+        Write-Output 'FALHOU: nenhum jogo valido foi escolhido para o bloco 4 (o id escolhido nao esta na'
+        Write-Output 'FALHOU: lista do catalogo lida) -- o bloco 4 do video ficaria sem jogo para comprar.'
+        Chk $false 'jogo-do-bloco-4-escolhido'
+    }
+}
 
 Step 'P10 - Redis (cache) e MongoDB (avaliacoes)'
 # O TTL da chave e de 60s: a listagem e lida IMEDIATAMENTE antes de olhar o Redis.
