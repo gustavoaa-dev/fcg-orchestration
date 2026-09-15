@@ -55,7 +55,10 @@ spec:
             # falam AMQP pelo Service, nao pelo nome de no.
             - name: RABBITMQ_NODENAME
               value: "rabbit@localhost"
-          # Estado do broker em volume: o mnesia/ abaixo de /var/lib/rabbitmq (o RABBITMQ_MNESIA_BASE).
+          # Estado do broker em volume: o RABBITMQ_MNESIA_BASE e /var/lib/rabbitmq/mnesia (nao
+          # /var/lib/rabbitmq) e o diretorio do no fica logo abaixo da base, em
+          # /var/lib/rabbitmq/mnesia/rabbit@<nome-do-no> -- por isso o volume monta /var/lib/rabbitmq
+          # inteiro e o nome do no e fixado em rabbit@localhost (acima).
           # Sem fsGroup de proposito -- o entrypoint inicia como root, faz o chown do diretorio para
           # o usuario rabbitmq e so entao desce privilegio com gosu.
           volumeMounts:

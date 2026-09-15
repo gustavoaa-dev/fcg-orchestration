@@ -29,6 +29,22 @@ CatalogAPI ──OrderPlacedEvent──→ PaymentsAPI (processa pagamento)
             CatalogAPI (adiciona à biblioteca)   Função de notificações (confirmação)
 ```
 
+## Atendimento dos requisitos da Fase 3
+
+Cada requisito da fase, onde ele está implementado e o comando que comprova — sem precisar navegar pelo repositório. A demonstração em vídeo segue a mesma ordem.
+
+| Requisito | Onde está | Como comprovar |
+|---|---|---|
+| **API Gateway** | `k8s/kong/kong-deployment.yaml`, `k8s/kong/kong.yml.template`, `scripts/deploy-kong.ps1` | `curl.exe -i http://localhost:8000/api/jogos` → `401`; com token → `200` (ver [API Gateway](#api-gateway-kong)) |
+| **Função serverless (escala a zero)** | repositório [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function), implantada por Terraform + KEDA (`k8s/keda/README.md`) | `kubectl get pods -l app=notifications-function` → nenhum pod; um cadastro faz o pod subir (~15 s) e o log aparecer (ver [Serverless](#serverless-função-de-notificações)) |
+| **Observabilidade (Opção A: Prometheus + Grafana)** | `k8s/prometheus-*.yaml`, `k8s/grafana-*.yaml`, `k8s/loki-deployment.yaml` | dashboard `FCG - APIs` em tempo real e logs em `FCG - Logs (Loki)` (ver [Observabilidade](#observabilidade)) |
+| **Persistência poliglota (NoSQL)** | `fcg-catalog-api` (`MongoDB.Driver`, `ReviewDocument`, `MongoReviewRepository`) | `PUT`/`GET /api/jogos/{id}/avaliacoes` (ver [Persistência poliglota e cache](#persistência-poliglota-e-cache)) |
+| **Cache distribuído (Redis)** | `fcg-catalog-api` (`CachedGameRepository`, `catalog:games:all`, `catalog:game:{id}`, TTL 60 s) | `kubectl exec deploy/redis -- redis-cli keys 'catalog:*'` e os contadores `cache_hit`/`cache_miss` no `/metrics` |
+| **Instrumentação nos microsserviços** | `prometheus-net` em `users-api`, `catalog-api` e `payments-api` | `kubectl port-forward svc/<api> 8080:80` + `curl.exe localhost:8080/metrics` |
+| **Segredos fora do repositório** | `.gitignore`, `.env.example`, seção [Segredos](#segredos) | `git grep -n 'FCG@Password123\|Fcg2024Test!'` → vazio |
+
+**Demonstração em vídeo:** *[link do vídeo]* — roteiro em [`docs/roteiro-video-fase3.md`](docs/roteiro-video-fase3.md).
+
 ## Como executar com Docker
 
 ### Pré-requisitos
@@ -394,7 +410,7 @@ kubectl delete secret sqlserver-secret users-api-secret catalog-api-secret payme
 Remove-Item .env
 ```
 
-> `kubectl delete -f k8s/` também remove os **três PVCs de estado** do cluster — `prometheus-data`, `sqlserver-data` e `rabbitmq-data` —, e o que eles guardam **não** volta do mesmo jeito: o Prometheus apenas recomeça a raspar do zero (perde os 7 dias de histórico), mas o **banco** (usuários, catálogo e biblioteca) e as **filas `notifications-*`**, das quais o KEDA depende para escalar a função, não se reconstroem — as filas do Terraform só voltam com o `terraform apply` do repositório da função, e o dado não volta de forma alguma. Use este comando quando a intenção for mesmo começar do zero; para derrubar só os workloads, escale os Deployments para `0` réplicas em vez de apagar o diretório inteiro.
+> `kubectl delete -f k8s/` também remove os **quatro PVCs de estado** do cluster — `prometheus-data`, `sqlserver-data`, `rabbitmq-data` e `mongo-data` —, e o que eles guardam **não** volta do mesmo jeito: o Prometheus apenas recomeça a raspar do zero (perde os 7 dias de histórico), mas o **banco** (usuários, catálogo e biblioteca), as **avaliações** guardadas no `mongo-data` e as **filas `notifications-*`**, das quais o KEDA depende para escalar a função, não se reconstroem — as filas do Terraform só voltam com o `terraform apply` do repositório da função, e o dado não volta de forma alguma. Use este comando quando a intenção for mesmo começar do zero; para derrubar só os workloads, escale os Deployments para `0` réplicas em vez de apagar o diretório inteiro.
 
 ## API Gateway (Kong)
 
