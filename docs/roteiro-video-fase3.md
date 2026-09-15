@@ -73,7 +73,7 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 - "O **MongoDB** guarda as avaliações dos jogos e o **Redis** é o cache de leitura do catálogo — o SQL Server continua dono do dado transacional."
 - "A observabilidade é a **Opção A**: Prometheus coletando os três `/metrics`, Grafana com os dashboards e **Loki** centralizando os logs — inclusive os da função, que não tem pod permanente."
 
-**Comandos:** nenhum. (Se quiser um comando de contexto: `kubectl get -n default pods` — 11 pods.)
+**Comandos:** nenhum. (Se quiser um comando de contexto: `kubectl get -n default pods` — **12 pods**: os 11 de infraestrutura/APIs mais o `promtail` do DaemonSet, que é o coletor de logs.)
 
 ## Bloco 2 — 0:35–2:50: Gateway: roteamento e segurança
 
@@ -115,10 +115,18 @@ curl.exe -s -o NUL -w 'com-token=%{http_code}\n' -H "Authorization: Bearer $toke
 
 > O `$dirDemo` do passo 0 é o **único** lugar onde o roteiro grava arquivo, e ele é apagado no fechamento (bloco 6, "higiene da sessão") — se este terminal for novo, repita o passo 0 antes de chamar `Login-FCG` (a função lê `$dirDemo` da sessão).
 
+**T3 — a Admin API do Kong (o `port-forward` bloqueia ESTE terminal até o fim do bloco):**
+
 ```powershell
-# 5) Admin API do Kong: rota /routes e plugin jwt — a prova do roteamento e da autenticacao
+# 5) Admin API do Kong: a rota /routes e o plugin jwt — a prova do roteamento e da autenticacao.
+#    Rode no T3 e deixe o forward ativo: o comando so termina com Ctrl+C, entao o T1 fica livre.
 kubectl port-forward -n default deploy/kong 8001:8001
-# T3 (outro terminal), com o forward ativo:
+```
+
+**T1 — com o forward ativo no T3, do terminal de comandos:**
+
+```powershell
+# 5b) As rotas e o plugin, lidos de OUTRO terminal (o T3 esta bloqueado pelo port-forward)
 curl.exe -s http://localhost:8001/routes
 curl.exe -s http://localhost:8001/plugins
 
@@ -161,7 +169,7 @@ curl.exe -s -o NUL -w 'cadastro=%{http_code}\n' -X POST http://localhost:8000/ap
 'email do cadastro: ' + $email
 ```
 
-**Na tela:** `cadastro=201` e, no T2, o pod `notifications-function-...` **aparecendo** e indo para `Running` — o KEDA consulta a fila a cada `pollingInterval` de **15 s**, e o tempo medido ponta a ponta nesta fase foi de **20 a 31 s** (é o número que o README registra): o pod aparece **em ~15–30 s**, não instantaneamente.
+**Na tela:** `cadastro=201` e, no T2, o pod `notifications-function-...` **aparecendo** e indo para `Running` — o pod aparece em **~15–30 s (pollingInterval de 15 s; medido 20–31 s)**, não instantaneamente: o KEDA consulta a fila a cada `pollingInterval` de **15 s** e o tempo medido ponta a ponta nesta fase foi de **20 a 31 s** (é o número que o README registra).
 
 **T3 — o log tem de aparecer na PLATAFORMA, não no terminal:**
 
@@ -331,7 +339,7 @@ A rede de segurança: o **alvo é 9:30** e o **teto duro é 10:00**, então há 
 
 ## Apoio: o que o preflight garante para esta gravação
 
-`scripts/preflight-fase3.ps1` roda **antes** de gravar e falha (`exit 1`) se qualquer peça do vídeo não estiver no ar: os 11 pods e o promtail, os **4 PVCs `Bound`**, o gateway (`401` sem token e `200` com token), os três alvos do job `fcg-apis` no Prometheus, o Loki `ready` e com log recente da stack (se ainda não houver log da **função** nas últimas 24 h, ele **avisa** em vez de reprovar — o cadastro do bloco 3 gera esse log ao vivo), o datasource e os dois dashboards do Grafana, as **três filas `notifications-*`** com o `ScaledObject Ready=True` (sem fila o KEDA cai em `TriggerError` e a **função simplesmente não sobe** — falha silenciosa que só apareceria na gravação), o Redis com as chaves `catalog:*`, o Mongo respondendo e — o mais importante — o **usuário e os jogos de demonstração**, além da **função em 0 réplicas** no estado inicial.
+`scripts/preflight-fase3.ps1` roda **antes** de gravar e falha (`exit 1`) se qualquer peça do vídeo não estiver no ar: os 11 pods e o promtail, os **4 PVCs `Bound`**, o gateway (`401` sem token e `200` com token), os três alvos do job `fcg-apis` no Prometheus, o Loki `ready` e com log recente da stack (se o rótulo da **função** ainda não existir nas últimas 24 h, ele **avisa** em vez de reprovar — o cadastro do bloco 3 gera esse log ao vivo; com o rótulo presente, ele exige **linhas** de verdade e reprova se não houver nenhuma), o datasource e os dois dashboards do Grafana, as **três filas `notifications-*`** com o `ScaledObject Ready=True` (sem fila o KEDA cai em `TriggerError` e a **função simplesmente não sobe** — falha silenciosa que só apareceria na gravação), o Redis com as chaves `catalog:*`, o Mongo respondendo e — o mais importante — o **usuário e os jogos de demonstração**, além da **função em 0 réplicas** no estado inicial.
 
 Sobre os dados de demonstração, ele garante **3 jogos** no catálogo, promove o usuário demo a Admin se precisar criar jogos (SQL por dentro do pod, digitado por **stdin**), **lê a biblioteca do usuário** (`GET /api/biblioteca/{userId}`) e escolhe/impressiona o **jogo do bloco 4**: o primeiro do catálogo que o usuário **não** possui — é esse id que vai em `$env:FCG_DEMO_JOGO` e que o bloco 4 (compra) e o bloco 5 (avaliações) usam. A **compra de verificação** que ele faz em seguida usa **outro** jogo, de propósito: comprar o do bloco 4 aqui consumiria a primeira compra daquele par (usuário, jogo), que é justamente a que devolve `202` e move o painel de pagamentos no vídeo.
 

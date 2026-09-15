@@ -14,8 +14,10 @@
 #   P6  Loki: /ready = ready (via proxy do kubectl, com -eq: um Loki que ainda nao esta pronto
 #       responde 503 "ingester not ready: waiting for 15s after being ready" e o -match aprovaria)
 #       e o rotulo app com log recente. O log DA FUNCAO e ATENCAO quando o rotulo ainda nao existe
-#       (o rotulo so nasce depois que a funcao sobe uma vez na retencao de 24h) e Chk de verdade
-#       quando existe: em nenhum dos casos ha [OK] sem verificacao -- ver a nota de contagem abaixo.
+#       (o rotulo so nasce depois que a funcao sobe uma vez na retencao de 24h). Quando o rotulo
+#       existe a checagem busca LINHAS de verdade na janela de 24h (query_range com start/end em
+#       epoch) e da [OK] so com linha lida: era tautologica (o Chk so existia no ramo em que o
+#       predicado ja era verdadeiro, sem poder reprovar) -- achado I4 da revisao final.
 #   P7  Grafana: /api/health ok, datasource Loki + Prometheus e os dashboards fcg-apis/fcg-logs
 #   P8  KEDA: as tres filas notifications-* existem no broker e o ScaledObject esta Ready=True
 #       (sem fila, o KEDA cai em TriggerError e a funcao SIMPLESMENTE NAO SOBE: falha silenciosa)
@@ -30,23 +32,31 @@
 #       volta ordenado por nome e a biblioteca cresce a cada rodada -- "o primeiro id do catalogo"
 #       daria 400 na compra do video). Se todos os jogos do catalogo ja forem dele, o preflight CRIA
 #       mais um jogo e REAVALIA a escolha; a checagem do bloco 4 e um predicado real (existe no
-#       catalogo E nao esta na biblioteca lida)
+#       catalogo E nao esta na biblioteca lida). A checagem da biblioteca exige PARSE do corpo:
+#       200 com corpo ilegivel (ParseOk = $false do Partir) REPROVA -- antes o corpo ilegivel virava
+#       "lista vazia" e a escolha saia sem verificacao (falha ABERTA, achado I2 da revisao final);
+#       so a lista vazia PARSEADA e "o usuario nao possui jogos"
 #   P10 Redis com as chaves catalog:* e o Mongo respondendo (GET .../avaliacoes = 200)
 #   P10b os comandos que SO aparecem no video sao exercitados aqui: as series dos paineis em
-#       /metrics (proxy do kubectl, sem port-forward), a compra de verificacao -- que usa OUTRO jogo,
-#       para nao consumir o do bloco 4, e so 202 e [OK]: 400/409 sao re-execucao (ATENCAO, nao conta) e
-#       QUALQUER outro codigo (401/403/5xx/000) REPROVA -- e o PUT/GET de avaliacao (upsert: 201 na 1a,
-#       200 na 2a) no jogo do bloco 4
+#       /metrics (proxy do kubectl, sem port-forward; o contador de pagamentos e lido DEPOIS da
+#       compra, porque a familia com labels so nasce no primeiro evento consumido -- achado I1),
+#       a compra de verificacao -- que usa OUTRO jogo, para nao consumir o do bloco 4, e so 202 e
+#       [OK]: 400/409 sao re-execucao (ATENCAO, nao conta) e QUALQUER outro codigo (401/403/5xx/000)
+#       REPROVA -- e o PUT/GET de avaliacao (upsert: 201 na 1a, 200 na 2a) no jogo do bloco 4
 #   P11 FUNCAO EM 0 REPLICAS (estado inicial da demo), esperando o cooldown do KEDA se preciso
 #
 # CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os casos de ATENCAO
-# (log da funcao ainda ausente no Loki; compra devolvendo 400/409 por posse; biblioteca devolvendo 404
-# por ainda nao existir -- que tambem tira a checagem do jogo do bloco 4, porque sem a lista lida a
-# posse nao pode ser verificada) sao VARIACAO LEGITIMA DE ESTADO: NAO emitem [OK] e NAO incrementam o
-# contador. Todo o resto reprova -- generalizar "!= 202" ou "!= 200" para ATENCAO engoliria justamente
-# os codigos que denunciam um endpoint quebrado. O total varia de 47 a 54: 51 no caminho ideal, +3 se o
-# preflight precisar promover o usuario a Admin (secret, login e o Role lido do banco), e -1 por cada
-# ATENCAO (-2 quando a biblioteca nao e lida: a checagem dela e a do jogo do bloco 4).
+# (log da funcao ainda ausente no Loki; compra devolvendo 400/409 por posse -- que, sem evento novo
+# nesta rodada, tambem deixa o contador de pagamentos sem prova e tira a checagem dele; biblioteca
+# devolvendo 404 por ainda nao existir -- que tambem tira a checagem do jogo do bloco 4, porque sem a
+# lista lida a posse nao pode ser verificada) sao VARIACAO LEGITIMA DE ESTADO: NAO emitem [OK] e NAO
+# incrementam o contador. Todo o resto reprova -- generalizar "!= 202" ou "!= 200" para ATENCAO
+# engoliria justamente os codigos que denunciam um endpoint quebrado. O total varia de 48 a 54: 51 no
+# caminho ideal; +3 se o preflight precisar promover o usuario a Admin (secret do sa, login apos a
+# promocao e o Role lido do banco); -1 quando o rotulo da funcao ainda nao existe no Loki; -2 quando a
+# biblioteca nao e lida (a checagem dela e a do jogo do bloco 4); -2 quando a compra de verificacao nao
+# e aceita E o contador de pagamentos nao esta no /metrics (a segunda ATENCAO so aparece nesse caso:
+# sem evento novo nao ha como provar a familia com labels).
 #
 # Nada de port-forward: o Prometheus e o Loki sao alcancados pelo proxy do kubectl
 # (kubectl get --raw .../services/<svc>:<porta>/proxy/...) e o Grafana por kubectl exec + wget.
@@ -56,8 +66,11 @@
 # SEGREDOS: a senha da demonstracao vem de $env:FCG_DEMO_SENHA (nao ha senha default no arquivo) e
 # os valores de Secret do cluster sao decodificados em memoria. O unico lugar em que uma senha toca
 # o disco e o corpo JSON temporario do login/cadastro, apagado no fim (bloco finally); toda saida
-# passa por San(), que troca os segredos por *** antes de imprimir -- inclusive a forma ESCAPADA da
-# senha do Grafana (a URL do kubectl exec carrega a senha URL-encoded, nao o valor cru).
+# passa por San(), que troca os segredos por *** antes de imprimir -- e a lista leva as DUAS formas da
+# senha do Grafana (crua e URL-encoded), mesmo depois de o I3 ter tirado a senha do argv do kubectl exec.
+# NENHUMA senha viaja como argumento de processo: a do sa e o $SA_PASSWORD do ambiente do container (SQL
+# por stdin + "sqlcmd -i") e a do Grafana e o $GF_SECURITY_ADMIN_PASSWORD, expandido pelo shell de
+# DENTRO do pod (antes ela ia embutida na URL do wget e aparecia no ps do host e do pod).
 #
 # Uso: $env:FCG_DEMO_SENHA = '<senha>'; powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1
 param(
@@ -104,14 +117,27 @@ function Body($nome, $json) {
     Set-Content -Path $p -Value $json -Encoding Ascii -NoNewline
     return '@' + $p
 }
+# Separa o codigo HTTP do corpo (o -w '|%{http_code}' do curl poe os dois na mesma string).
+# ParseOk = "HOUVE corpo e ele virou JSON" (nao apenas "o ConvertFrom-Json nao lancou"): corpo vazio e
+# so espacos NAO contam como corpo -- medido no PowerShell 5.1, `'' | ConvertFrom-Json` e
+# `'   ' | ConvertFrom-Json` NAO lancam nada e devolvem $null, entao sem essa checagem um 200 de corpo
+# vazio continuaria virando "lista vazia". Sem o ParseOk, um 200 com HTML/texto virava Body = $null, o
+# extrator de listas lia isso como lista vazia e a checagem da biblioteca saia [OK] sem ter lido nada:
+# a escolha do jogo do bloco 4 caia no primeiro do catalogo, SEM verificacao (falha ABERTA medida na
+# revisao final). O catch continua engolindo a excecao (o script nao pode morrer no meio de uma
+# checagem), mas o resultado NAO e ambiguo: Body = $null COM ParseOk = $false e "corpo ilegivel";
+# Body = $null COM ParseOk = $true e "JSON valido que e null" (o literal `null`).
 function Partir($raw) {
     $i = $raw.LastIndexOf('|')
-    if ($i -lt 0) { return @{ Code = ''; Texto = $raw; Body = $null } }
+    if ($i -lt 0) { return @{ Code = ''; Texto = $raw; Body = $null; ParseOk = $false } }
     $code = $raw.Substring($i + 1).Trim()
     $texto = $raw.Substring(0, $i)
     $obj = $null
-    try { $obj = ($texto | ConvertFrom-Json) } catch { }
-    return @{ Code = $code; Texto = $texto; Body = $obj }
+    $parseOk = $false
+    if (-not [string]::IsNullOrWhiteSpace($texto)) {
+        try { $obj = ($texto | ConvertFrom-Json); $parseOk = $true } catch { $obj = $null; $parseOk = $false }
+    }
+    return @{ Code = $code; Texto = $texto; Body = $obj; ParseOk = $parseOk }
 }
 function Resposta($url, $method, $bodyArg, $token) {
     $a = @('-s', '--max-time', '60', '-X', $method)
@@ -236,9 +262,24 @@ function IdsDaBiblioteca($corpo) {
     return $ids
 }
 # A API do Grafana e alcancada de DENTRO do pod (wget do proprio container): nao ha port-forward.
+# A SENHA NAO VAI NO argv DO kubectl exec (achado I3 da revisao final): ela ja esta no ambiente do
+# container (GF_SECURITY_ADMIN_PASSWORD, do Secret grafana-admin), entao quem a expande e o shell de
+# dentro do pod -- antes ia embutida na URL como argumento, visivel na linha de comando do kubectl no
+# host e no ps do pod. Um unico argumento para o sh -c e SEM aspas internas, pela mesma armadilha do
+# PowerShell 5.1 que picava o argumento do sqlcmd.
+# Defensivo: se a senha tiver um caractere que quebra o userinfo da URL ("#", "?", "/"), o wget nao
+# autentica e o Grafana responde 401 "Invalid username or password" -- nesse caso a chamada e repetida
+# com --user/--password (que nao passam por URL). Se a imagem nao suportar essas flags, a resposta
+# original volta e as checagens reprovam com a causa a vista.
 function GrafanaApi($caminho) {
-    $url = 'http://admin:' + [uri]::EscapeDataString($script:senhaGrafana) + '@localhost:3000' + $caminho
-    return (San (((kubectl exec -n $namespace deploy/grafana -- wget -qO- $url 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+    $cmdGrafana = 'wget -qO- http://admin:$GF_SECURITY_ADMIN_PASSWORD@localhost:3000' + $caminho
+    $respostaGrafana = (San (((kubectl exec -n $namespace deploy/grafana -- sh -c $cmdGrafana 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+    if ($respostaGrafana -match 'Invalid username or password') {
+        $cmdGrafanaSenha = 'wget -qO- --user=admin --password=$GF_SECURITY_ADMIN_PASSWORD http://localhost:3000' + $caminho
+        $respostaSemUrl = (San (((kubectl exec -n $namespace deploy/grafana -- sh -c $cmdGrafanaSenha 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
+        if ($respostaSemUrl -match '\S') { return $respostaSemUrl }
+    }
+    return $respostaGrafana
 }
 function Token {
     $b = Body 'login.json' ('{"email":"' + $Email + '","senha":"' + $Senha + '"}')
@@ -356,14 +397,41 @@ for ($i = 0; $i -lt 4; $i++) {
 }
 'rotulos app no Loki = ' + $(if ($rotulos.Count -gt 0) { $rotulos -join ', ' } else { '(nenhum)' })
 Chk ($rotulos.Count -ge 1) 'loki-rotulo-app-com-log'
-# A checagem do log da FUNCAO e a propria existencia do rotulo -- mas ela NAO pode reprovar a gravacao:
-# o rotulo so existe depois de a funcao subir UMA vez dentro da retencao de 24h do Loki, e quem vai
-# fazer a funcao subir e o proprio video (o cadastro do bloco 3). Por isso, quando o rotulo existe o
-# Chk roda de verdade (1 checagem); quando nao existe, sai ATENCAO e a checagem NAO e contada --
-# nada de [OK] sem verificacao.
+# A checagem do log da FUNCAO era o proprio rotulo ($temLogDaFuncao) -- e isso e TAUTOLOGIA: o Chk so
+# existia no ramo em que o predicado ja era verdadeiro, entao nao podia reprovar nada e ainda inflava a
+# contagem (achado I4 da revisao final). Agora o ramo do rotulo presente busca LINHAS de verdade na
+# janela de 24h: /loki/api/v1/label/app/values prova que o cliente funciona, mas as LINHAS vem do
+# query_range (start/end em epoch de SEGUNDOS). Este ramo PODE falhar -- rotulo presente e nenhuma linha
+# legivel -- e e exatamente para isso que ele existe. O ramo do rotulo ausente continua ATENCAO, sem
+# [OK] e sem contar: o rotulo so nasce depois que a funcao sobe uma vez na retencao de 24h.
 $temLogDaFuncao = ($rotulos -contains 'notifications-function')
 if ($temLogDaFuncao) {
-    Chk $temLogDaFuncao 'loki-log-da-funcao-de-notificacoes'
+    # O filtro vai URL-encoded ({app="notifications-function"} tem chaves e aspas, que o PowerShell 5.1
+    # nao entrega inteiras em argumento de processo nativo -- mesma armadilha do sqlcmd). O `&` dos
+    # parametros e seguro: o comando e chamado direto, sem cmd no meio.
+    $agoraLoki = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $caminhoLinhas = ('/api/v1/namespaces/' + $namespace + '/services/loki:3100/proxy/loki/api/v1/query_range?query=%7Bapp%3D%22notifications-function%22%7D&limit=20&start=' + ($agoraLoki - 86400) + '&end=' + $agoraLoki)
+    $linhasFuncao = 0
+    $respostaLinhas = ''
+    try {
+        $respostaLinhas = Kraw $caminhoLinhas
+        $jsonLinhas = ($respostaLinhas | ConvertFrom-Json)
+        # @($null) conta como UM elemento: sem o filtro, uma resposta sem 'result' viraria 1 "linha".
+        foreach ($fluxo in @($jsonLinhas.data.result | Where-Object { $_ -ne $null })) {
+            if ($fluxo.values) { $linhasFuncao += @($fluxo.values | Where-Object { $_ -ne $null }).Count }
+        }
+    } catch { $linhasFuncao = 0 }
+    'linhas de notifications-function na janela de 24h = ' + $linhasFuncao + '  (esperado >= 1)'
+    if ($linhasFuncao -lt 1) {
+        Write-Output 'FALHOU: o rotulo notifications-function existe no Loki, mas nenhuma LINHA foi lida na'
+        Write-Output 'FALHOU: janela de 24h -- o painel de logs do bloco 3 nao teria o que mostrar. Remedio:'
+        Write-Output 'FALHOU: um cadastro pelo gateway gera uma linha nova; se ainda assim nao aparecer, confira'
+        Write-Output 'FALHOU: o Promtail (k8s/promtail-deployment.yaml), que e quem coleta o log dos pods.'
+        $amostraLinhas = (San ((([string]$respostaLinhas) -replace '\s+', ' '))).Trim()
+        if ($amostraLinhas.Length -gt 300) { $amostraLinhas = $amostraLinhas.Substring(0, 300) }
+        Write-Output ('  resposta do Loki (resumida) = ' + $(if ($amostraLinhas) { $amostraLinhas } else { '(vazia)' }))
+    }
+    Chk ($linhasFuncao -ge 1) 'loki-log-da-funcao-de-notificacoes'
 } else {
     Write-Output 'ATENCAO: ainda nao ha log de notifications-function no Loki (a funcao nao rodou nas'
     Write-Output 'ATENCAO: ultimas 24h). Faca um cadastro pelo gateway e confira de novo; o bloco'
@@ -372,34 +440,38 @@ if ($temLogDaFuncao) {
 }
 
 Step 'P7 - Grafana: saude, datasources e dashboards'
+# A senha do Secret e lida em memoria por dois motivos: diagnostico (sem ela o container tambem esta
+# sem GF_SECURITY_ADMIN_PASSWORD e o pod nem sobe) e a lista de segredos que o San() mascara. Ela NAO
+# e mais necessaria para consultar a API -- desde a correcao do I3 quem autentica e o shell DENTRO do
+# pod, com a variavel do proprio ambiente --, entao uma leitura falha do Secret nao reprova sozinha:
+# quem reprova e a resposta da API (e essa leitura nao curto-circuita mais as cinco checagens abaixo).
 $script:senhaGrafana = SecretValor 'grafana-admin' 'admin-password'
-if (-not $script:senhaGrafana) {
-    'nao consegui ler o Secret grafana-admin/admin-password: a API do Grafana nao sera consultada'
-    Chk $false 'grafana-health-ok'
-    Chk $false 'grafana-datasource-loki'
-    Chk $false 'grafana-dashboard-fcg-apis'
-    Chk $false 'grafana-dashboard-fcg-logs'
-} else {
+if ($script:senhaGrafana) {
     $script:segredos += $script:senhaGrafana
-    # A URL do Grafana carrega a senha ESCAPADA ([uri]::EscapeDataString): "P@ss!9#x" vira
-    # "P%40ss!9%23x" e nao seria mascarado pelo valor cru. As duas formas entram na lista.
+    # As DUAS formas da senha entram na lista: a crua e a escapada ([uri]::EscapeDataString). A forma
+    # escapada nao viaja em saida nenhuma depois do I3, mas manter as duas e uma linha e a lista de
+    # segredos e o unico ponto de defesa da saida -- mais barato que uma senha no relatorio.
     $script:segredos += [uri]::EscapeDataString($script:senhaGrafana)
-    $health = $null
-    try { $health = (GrafanaApi '/api/health' | ConvertFrom-Json) } catch { $health = $null }
-    'grafana /api/health = ' + $(if ($health) { 'database=' + $health.database + ' version=' + $health.version } else { '(sem resposta)' })
-    Chk ($health -and $health.database -eq 'ok') 'grafana-health-ok'
-    $ds = @()
-    try { $ds = @(GrafanaApi '/api/datasources' | ConvertFrom-Json) } catch { $ds = @() }
-    'datasources = ' + $(if ($ds.Count -gt 0) { (@($ds | ForEach-Object { $_.uid }) -join ', ') } else { '(nenhum)' })
-    Chk ((@($ds | Where-Object { $_.uid -eq 'loki' }).Count) -ge 1) 'grafana-datasource-loki'
-    Chk ((@($ds | Where-Object { $_.uid -eq 'prometheus' }).Count) -ge 1) 'grafana-datasource-prometheus'
-    $dash = @()
-    try { $dash = @(GrafanaApi '/api/search?query=FCG' | ConvertFrom-Json) } catch { $dash = @() }
-    $uids = @($dash | ForEach-Object { $_.uid })
-    'dashboards encontrados = ' + $(if ($uids.Count -gt 0) { $uids -join ', ' } else { '(nenhum)' })
-    Chk ($uids -contains 'fcg-apis') 'grafana-dashboard-fcg-apis'
-    Chk ($uids -contains 'fcg-logs') 'grafana-dashboard-fcg-logs'
+} else {
+    Write-Output 'nao consegui ler o Secret grafana-admin/admin-password: a consulta abaixo NAO depende'
+    Write-Output 'dele (quem autentica e o $GF_SECURITY_ADMIN_PASSWORD do container). Se o Secret faltar,'
+    Write-Output 'o pod do Grafana nem sobe -- o que a checagem do P1 pega.'
 }
+$health = $null
+try { $health = (GrafanaApi '/api/health' | ConvertFrom-Json) } catch { $health = $null }
+'grafana /api/health = ' + $(if ($health) { 'database=' + $health.database + ' version=' + $health.version } else { '(sem resposta)' })
+Chk ($health -and $health.database -eq 'ok') 'grafana-health-ok'
+$ds = @()
+try { $ds = @(GrafanaApi '/api/datasources' | ConvertFrom-Json) } catch { $ds = @() }
+'datasources = ' + $(if ($ds.Count -gt 0) { (@($ds | ForEach-Object { $_.uid }) -join ', ') } else { '(nenhum)' })
+Chk ((@($ds | Where-Object { $_.uid -eq 'loki' }).Count) -ge 1) 'grafana-datasource-loki'
+Chk ((@($ds | Where-Object { $_.uid -eq 'prometheus' }).Count) -ge 1) 'grafana-datasource-prometheus'
+$dash = @()
+try { $dash = @(GrafanaApi '/api/search?query=FCG' | ConvertFrom-Json) } catch { $dash = @() }
+$uids = @($dash | ForEach-Object { $_.uid })
+'dashboards encontrados = ' + $(if ($uids.Count -gt 0) { $uids -join ', ' } else { '(nenhum)' })
+Chk ($uids -contains 'fcg-apis') 'grafana-dashboard-fcg-apis'
+Chk ($uids -contains 'fcg-logs') 'grafana-dashboard-fcg-logs'
 
 Step 'P8 - KEDA: filas do broker e ScaledObject'
 $filas = (San (((kubectl exec -n $namespace deploy/rabbitmq -- rabbitmqctl list_queues name 2>&1) | ForEach-Object { [string]$_ }) -join "`n"))
@@ -426,8 +498,19 @@ Step 'P9 - dados de demonstracao: jogos no catalogo e o jogo do bloco 4'
 $lista = Resposta ($Gateway + '/api/jogos') 'GET' $null $token
 $jogos = @($lista.Body | Where-Object { $_ -ne $null })
 'GET /api/jogos = ' + $lista.Code + '  jogos no catalogo = ' + $jogos.Count + '  (minimo ' + $JogosMinimos + ')'
-Chk ($lista.Code -eq '200') 'catalogo-listagem-200'
-if ($jogos.Count -lt $JogosMinimos) {
+# A checagem do catalogo tambem exige PARSE (mesma classe do I2 na biblioteca, e aqui o efeito
+# colateral seria pior): um 200 de corpo ilegivel vira "catalogo vazio" e o preflight comecaria a
+# PROMOVER o usuario a Admin e a CRIAR jogos a partir de um corpo que ele nao conseguiu ler.
+# Com ParseOk no predicado, o corpo ilegivel reprova aqui e nada e criado a partir dele.
+Chk ($lista.Code -eq '200' -and $lista.ParseOk) 'catalogo-listagem-200'
+if (-not $lista.ParseOk) {
+    Write-Output ('FALHOU: GET /api/jogos respondeu ' + $lista.Code + ' com um corpo que NAO deu para ler como')
+    Write-Output ('FALHOU: JSON (' + ([string]$lista.Texto).Length + ' caractere(s)): nao ha catalogo para escolher o jogo do')
+    Write-Output 'FALHOU: bloco 4, e NADA sera criado a partir deste corpo.'
+    $amostraCatalogo = (San ((([string]$lista.Texto) -replace '\s+', ' '))).Trim()
+    if ($amostraCatalogo.Length -gt 300) { $amostraCatalogo = $amostraCatalogo.Substring(0, 300) }
+    if ($amostraCatalogo) { Write-Output ('FALHOU: inicio do corpo recebido = ' + $amostraCatalogo) }
+} elseif ($jogos.Count -lt $JogosMinimos) {
     Write-Output '*** AVISO: faltam jogos para a demonstracao (o dado do SQL Server e volatil enquanto o ***'
     Write-Output '*** AVISO: PVC nao entrar: qualquer restart de container esvazia o banco). Criando agora. ***'
     # O POST /api/jogos exige Admin e a users-api registra todos como Usuario: promocao direta no SQL.
@@ -488,12 +571,31 @@ $bibliotecaVazia = ($bib.Code -eq '404')
 if ($bibliotecaLida) {
     $itensBiblioteca = @(ItensDaBiblioteca $bib.Body)
     $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
-    # A checagem NAO pode dar [OK] so pelo transporte: 200 com itens e ZERO ids reconhecidos e QUEBRA
-    # DE CONTRATO (foi assim que a escolha errada saiu com a linha verde na rodada 2). Lista vazia e
-    # legitima: o usuario simplesmente nao possui nada.
-    $bibliotecaInterpretavel = ($itensBiblioteca.Count -eq 0) -or ($idsBiblioteca.Count -eq $itensBiblioteca.Count)
+    # A checagem NAO pode dar [OK] so pelo transporte -- nem por um corpo que nem e JSON:
+    #   * 200 com itens e ZERO ids reconhecidos e QUEBRA DE CONTRATO (foi assim que a escolha errada
+    #     saiu com a linha verde na rodada 2);
+    #   * 200 com corpo ILEGIVEL (ParseOk = $false: HTML de proxy, texto solto) ou VAZIO (corpo de 0
+    #     caractere, que o ConvertFrom-Json do 5.1 aceita calado devolvendo $null) e o buraco que a
+    #     revisao final mediu: o catch do Partir devolvia Body = $null, o extrator lia "lista vazia",
+    #     a escolha do bloco 4 caia no primeiro jogo do catalogo SEM verificacao e as DUAS checagens
+    #     saiam verdes. Por isso o ParseOk entra no predicado;
+    #   * lista vazia PARSEADA (200 com "[]") continua sendo o caso LEGITIMO de "usuario sem jogos" --
+    #     a API responde Ok(lista) (BibliotecaController), entao o caso vazio sai como "[]" no corpo:
+    #     corpo vazio/ilegivel nao e contrato valido, so a lista vazia de verdade e.
+    $bibliotecaInterpretavel = ($bib.ParseOk -and (($itensBiblioteca.Count -eq 0) -or ($idsBiblioteca.Count -eq $itensBiblioteca.Count)))
     'biblioteca do usuario demo = ' + $itensBiblioteca.Count + ' item(ns), ' + $idsBiblioteca.Count + ' id(s) reconhecido(s)'
-    if ($bibliotecaInterpretavel) {
+    if (-not $bib.ParseOk) {
+        $corpoVazio = [string]::IsNullOrWhiteSpace([string]$bib.Texto)
+        Write-Output ('FALHOU: a biblioteca respondeu 200 com ' + $(if ($corpoVazio) { 'corpo VAZIO' } else { 'um corpo que NAO e JSON' }) + ' (' + ([string]$bib.Texto).Length + ' caractere(s)).')
+        Write-Output 'FALHOU: sem o parse nao da para distinguir "o usuario nao possui jogos" de "o corpo nao'
+        Write-Output 'FALHOU: foi lido": ate a revisao final esse corpo virava lista VAZIA, a escolha do bloco'
+        Write-Output 'FALHOU: 4 saia no escuro e as duas checagens ficavam verdes.'
+        if (-not $corpoVazio) {
+            $amostraBib = (San ((([string]$bib.Texto) -replace '\s+', ' '))).Trim()
+            if ($amostraBib.Length -gt 300) { $amostraBib = $amostraBib.Substring(0, 300) }
+            Write-Output ('FALHOU: inicio do corpo recebido = ' + $amostraBib)
+        }
+    } elseif ($bibliotecaInterpretavel) {
         if ($itensBiblioteca.Count -gt 0) { 'ids da biblioteca = ' + ($idsBiblioteca -join ', ') }
         else { '(lista vazia: o usuario nao possui nenhum jogo)' }
     } else {
@@ -617,14 +719,16 @@ if ($jogoDemo) {
 
 Step 'P10b - series dos paineis e os comandos de compra/avaliacao do video'
 # Os paineis do dashboard FCG - APIs derivam destas series (as de cache tem o nome CRU, sem _total).
+# As quatro series abaixo ja existem sem a compra: users-api e catalog-api atenderam o login, a
+# listagem e a biblioteca deste proprio preflight, e cache_hit/cache_miss nascem no start do
+# catalog-api. O CONTADOR DE PAGAMENTOS e outro caso -- ver o bloco depois da compra, logo abaixo
+# (achado I1 da revisao final).
 $mUsers = Metricas 'users-api:80'
 $mCatalog = Metricas 'catalog-api:80'
-$mPayments = Metricas 'payments-api:80'
 Chk ($mUsers -match 'http_requests_received_total') 'metrics-users-api-http-requests'
 Chk ($mCatalog -match 'http_requests_received_total') 'metrics-catalog-api-http-requests'
 Chk ($mCatalog -match '(?m)^cache_hit') 'metrics-catalog-api-cache-hit'
 Chk ($mCatalog -match '(?m)^cache_miss') 'metrics-catalog-api-cache-miss'
-Chk ($mPayments -match '(?m)^fcg_payments_processados_total') 'metrics-payments-api-contador-de-negocio'
 # A compra do preflight NAO usa o jogo do bloco 4: usa o ULTIMO jogo do catalogo que NAO seja ele.
 # Motivo: o jogo escolhido no P9 e o que o video vai comprar, e so a PRIMEIRA compra daquele par
 # (usuario, jogo) devolve 202 e move o painel de pagamentos -- consumindo-o aqui, o bloco 4 cairia em
@@ -634,9 +738,12 @@ for ($i = $jogos.Count - 1; $i -ge 0; $i--) {
     $idCand = [string]$jogos[$i].id
     if ($idCand -and ($idCand -ne $jogoDemo)) { $jogoVerificacao = $idCand; break }
 }
+$compraAceita = $false
+$codCompra = ''
 if ($userId -and $jogoVerificacao) {
     $bCompra = Body 'compra.json' ('{"userId":"' + $userId + '","gameId":"' + $jogoVerificacao + '"}')
     $rCompra = Resposta ($Gateway + '/api/jogos/' + $jogoVerificacao + '/comprar') 'POST' $bCompra $token
+    $codCompra = $rCompra.Code
     'POST /api/jogos/{id}/comprar = ' + $rCompra.Code + '  (esperado 202)  jogo de verificacao=' + $jogoVerificacao
     '  corpo = ' + $rCompra.Texto
     # Tres desfechos, e SO um deles e sucesso:
@@ -675,6 +782,41 @@ if ($userId -and $jogoVerificacao) {
 } else {
     'sem userId no token ou sem jogo de verificacao: a compra do bloco 4 do video nao pode ser exercitada'
     Chk $false 'compra-aceita-202'
+}
+# O CONTADOR DE PAGAMENTOS E LIDO **DEPOIS** DA COMPRA (achado I1 da revisao final). No prometheus-net
+# 8.2.1 uma familia COM LABELS nao cria filho nenhum ate o primeiro WithLabels(...) (Collector.cs):
+# fcg_payments_processados_total so passa a existir no /metrics do payments-api DEPOIS que o consumidor
+# processa o primeiro OrderPlacedEvent. Lida ANTES da compra -- que era o caso -- ela reprovava a
+# gravacao num cluster em que o payments-api subiu ha pouco e ainda nao processou pagamento nenhum:
+# falso positivo medido pela revisao. Depois de uma compra ACEITA (202) o evento foi publicado, entao o
+# contador TEM de aparecer -- e a espera curta cobre a latencia do consumo assincrono (sem ela, a
+# checagem trocaria um falso positivo por uma corrida). Nao ha rebuild do payments-api nesta onda: a
+# pre-criacao dos labels ficou parkada como divida.
+$mPayments = Metricas 'payments-api:80'
+$temContadorPagamentos = [bool]($mPayments -match '(?m)^fcg_payments_processados_total')
+if ((-not $temContadorPagamentos) -and $compraAceita) {
+    for ($tentativaMetrica = 1; $tentativaMetrica -le 6; $tentativaMetrica++) {
+        'aguardando o payments-api consumir o evento da compra aceita (tentativa ' + $tentativaMetrica + '/6)...'
+        Start-Sleep -Seconds 5
+        $mPayments = Metricas 'payments-api:80'
+        if ($mPayments -match '(?m)^fcg_payments_processados_total') { $temContadorPagamentos = $true; break }
+    }
+}
+'contador fcg_payments_processados_total no /metrics do payments-api = ' + $temContadorPagamentos
+if ($temContadorPagamentos) {
+    Chk $temContadorPagamentos 'metrics-payments-api-contador-de-negocio'
+} elseif ($compraAceita) {
+    Write-Output 'FALHOU: a compra foi ACEITA (202) e publicou o OrderPlacedEvent, mas o contador'
+    Write-Output 'FALHOU: fcg_payments_processados_total nao apareceu no /metrics do payments-api nem'
+    Write-Output 'FALHOU: depois de 30s de espera: o painel "Pagamentos processados por status" ficaria'
+    Write-Output 'FALHOU: sem serie no bloco 4 (consumidor parado ou instrumentacao ausente).'
+    Chk $false 'metrics-payments-api-contador-de-negocio'
+} else {
+    Write-Output 'ATENCAO: o contador nao esta no /metrics e a compra de verificacao NAO foi aceita nesta'
+    Write-Output ('ATENCAO: rodada (codigo ' + $(if ($codCompra) { $codCompra } else { 'nenhum: sem userId/jogo' }) + '): sem evento NOVO consumido,')
+    Write-Output 'ATENCAO: a familia com labels pode simplesmente ainda nao existir nesse payments-api (ela'
+    Write-Output 'ATENCAO: so nasce no primeiro WithLabels). Para provar o contador, rode de novo.'
+    Write-Output '(esta situacao NAO entra na contagem de checagens: nao houve evento para provar o contador)'
 }
 if ($jogoDemo) {
     # O PUT e upsert por (gameId, userId): 201 na primeira avaliacao e 200 ao atualizar. E o MESMO
@@ -736,7 +878,7 @@ if ($script:falhas -gt 0) {
     Write-Output ('  jogo do bloco 4 (compra) = ' + $jogoDemoNome + ' (' + $jogoDemo + ')  -- e o mesmo id serve para o bloco 5 (avaliacoes)')
     Write-Output '  (este jogo e o primeiro do catalogo que o usuario demo NAO possui: a primeira compra dele devolve 202 e move o painel)'
     Write-Output '  (a compra de verificacao deste preflight foi em OUTRO jogo, de proposito, para nao consumir o do bloco 4)'
-    Write-Output '  funcao de notificacoes: 0 replicas (o cadastro do bloco serverless sobe o pod em ~15-30s)'
+    Write-Output '  funcao de notificacoes: 0 replicas (o cadastro do bloco serverless sobe o pod em ~15-30s (pollingInterval de 15s; medido 20-31s))'
     Write-Output '  roteiro: docs/roteiro-video-fase3.md'
 }
 # O temporario guarda o corpo do login/cadastro com a senha da demo em claro: apagar SEMPRE.
