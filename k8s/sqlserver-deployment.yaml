@@ -41,11 +41,20 @@ spec:
             - containerPort: 1433
           resources:
             limits:
-              memory: "1Gi"
+              memory: "2Gi"
               cpu: "1000m"
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
           env:
             - name: ACCEPT_EULA
               value: "Y"
+            # A imagem do SQL Server dimensiona o consumo pela memoria do NO, nao pelo cgroup:
+            # com limite de 1Gi ele tentava alocar alem do limite e abortava (exit 235, "unable to
+            # allocate MsqlXactManager" / Error 17300). O limite interno abaixo faz o SQL Server
+            # respeitar o cgroup, e o limite do container subiu para o minimo recomendado (2 GB).
+            - name: MSSQL_MEMORY_LIMIT_MB
+              value: "1536"
             # A senha vem do Secret `sqlserver-secret` (chave `sa-password`), criado por
             # `kubectl create secret` ANTES do apply -- ver a secao "Segredos" do README.
             - name: SA_PASSWORD
