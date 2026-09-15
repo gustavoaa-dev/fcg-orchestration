@@ -7,13 +7,15 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 | Tempo | Bloco | Na tela |
 |---|---|---|
 | 0:00–0:45 | **Abertura e arquitetura** | README aberto na seção *Arquitetura* + diagrama de fluxo de eventos; 1 frase por componente (Kong, 3 APIs, função, Mongo, Redis, Prometheus/Grafana/Loki) |
-| 0:45–3:00 | **Gateway: roteamento e segurança** | `kubectl get svc kong` (Service do gateway) → `curl.exe -i http://localhost:8000/api/jogos` (**401**) → `curl.exe -X POST http://localhost:8000/api/auth/login -d '{...}'` (**200** + token) → `curl.exe -H "Authorization: Bearer <token>" .../api/jogos` (**200**) → `kubectl port-forward deploy/kong 8001:8001` + `curl.exe localhost:8001/routes` (mostra as rotas) e a config DB-less com o plugin `jwt`; fechar mostrando que `svc/users-api` é `ClusterIP` (API não exposta) |
-| 3:00–5:15 | **Função serverless + log centralizado** | `kubectl get deploy notifications-function` (**0/0**) → `kubectl get pods -l app=notifications-function -w` em um terminal → cadastro pelo gateway (`201`) → **pod sobe em ~15–30 s** → Grafana `FCG - Logs (Loki)` com `[EMAIL ENVIADO] Boas-vindas para ...` (o log aparece **na plataforma**, não no terminal) → pod volta a zero |
+| 0:45–3:00 | **Gateway: roteamento e segurança** | `kubectl get -n default svc kong` (Service do gateway) → `curl.exe -i http://localhost:8000/api/jogos` (**401**) → `curl.exe -X POST http://localhost:8000/api/auth/login -d '{...}'` (**200** + token) → `curl.exe -H "Authorization: Bearer <token>" .../api/jogos` (**200**) → `kubectl port-forward -n default deploy/kong 8001:8001` + `curl.exe localhost:8001/routes` (mostra as rotas) e a config DB-less com o plugin `jwt`; fechar mostrando que `svc/users-api` é `ClusterIP` (API não exposta) |
+| 3:00–5:15 | **Função serverless + log centralizado** | `kubectl get -n default deploy notifications-function` (**0/0**) → `kubectl get -n default pods -l app=notifications-function -w` em um terminal → cadastro pelo gateway (`201`) → **pod sobe em ~15–30 s** → Grafana `FCG - Logs (Loki)` com `[EMAIL ENVIADO] Boas-vindas para ...` (o log aparece **na plataforma**, não no terminal) → pod volta a zero |
 | 5:15–7:30 | **Observabilidade (Opção A)** | `scripts/demo-trafego.ps1 -Segundos 90` rodando em um terminal + dashboard `FCG - APIs` em tela cheia (latência p50/p95, RPS, status code, erros, `up`) → Prometheus `Status → Targets` com **3 alvos `up`** → painel *Pagamentos processados por status* mexendo após uma compra |
-| 7:30–9:15 | **NoSQL na arquitetura** | `PUT /api/jogos/{id}/avaliacoes` (upsert devolve o documento persistido) → `GET /api/jogos/{id}/avaliacoes` (lista vinda do Mongo) → `kubectl exec deploy/redis -- redis-cli keys 'catalog:*'` + `type`/`ttl` → contadores `cache_hit`/`cache_miss`; explicar **por que** Mongo (documento flexível de avaliação) e **por que** Redis (cache de leitura com TTL 60 s), e que o SQL continua dono do dado transacional |
-| 9:15–10:00 | **Repositórios e fechamento** | tabela de repositórios do README (5 repos, incluindo o link da função) + a seção *Atendimento dos requisitos da Fase 3*; fechar com "como subir tudo": `kubectl create secret ...` → `kubectl apply -f k8s/` → `scripts/deploy-kong.ps1` |
+| 7:30–9:15 | **NoSQL na arquitetura** | `PUT /api/jogos/{id}/avaliacoes` (upsert devolve o documento persistido) → `GET /api/jogos/{id}/avaliacoes` (lista vinda do Mongo) → `kubectl exec -n default deploy/redis -- redis-cli keys 'catalog:*'` + `type`/`ttl` → contadores `cache_hit`/`cache_miss`; explicar **por que** Mongo (documento flexível de avaliação) e **por que** Redis (cache de leitura com TTL 60 s), e que o SQL continua dono do dado transacional |
+| 9:15–10:00 | **Repositórios e fechamento** | tabela de repositórios do README (5 repos, incluindo o link da função) + a seção *Atendimento dos requisitos da Fase 3*; fechar com "como subir tudo": `kubectl create -n default secret ...` → `kubectl apply -n default -f k8s/` → `scripts/deploy-kong.ps1` |
 
 **Soma dos tempos: 0:45 + 2:15 + 2:15 + 2:15 + 1:45 + 0:45 = 10:00.** O roteiro cabe no limite de 10 minutos com **zero folga** — se um bloco estourar, aplique a regra de corte do fim do documento (a primeira coisa a cair é o `port-forward` da Admin API do Kong, no bloco 2). Os blocos 3 e 4 têm **espera real** (o pod da função e o scrape de 15 s do Prometheus): narre durante a espera em vez de cortá-la — a espera é a evidência.
+
+> **Namespace, em todo o roteiro:** cada comando `kubectl` leva **`-n default`** (o namespace onde a plataforma roda), e o caminho de proxy do kubectl carrega o namespace **dentro do próprio caminho** (`kubectl get --raw '/api/v1/namespaces/default/services/...'`). As duas formas apontam para o mesmo lugar — nada aqui depende do namespace do contexto, que pode estar em outro namespace sem que você perceba.
 
 ## Antes de apertar REC
 
@@ -40,7 +42,7 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 
 2. **A senha da demonstração vive só na variável de ambiente** `FCG_DEMO_SENHA` (o preflight e o gerador de tráfego leem dela; nenhum dos dois tem senha padrão no arquivo). Ela precisa atender à política do cadastro: **8+ caracteres, com ao menos uma letra, um dígito e um caractere especial**.
 3. **Estado inicial esperado:** os 11 pods de infraestrutura/APIs `Running` e `Ready`, o Promtail `Running`, a função de notificações em **0 réplicas** (nenhum pod) e o usuário `demo@fcg.local` já existente, com o catálogo contendo pelo menos **3 jogos** (o mínimo que garante um jogo livre para a compra do bloco 4 mesmo depois de rodadas anteriores) — é o que o preflight deixa pronto.
-4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` e `$env:FCG_DEMO_JOGO` definidas. O **diretório de sessão** que guarda os corpos de requisição nasce no passo 0 do bloco 2 e é apagado no fechamento (bloco 6) — mantenha o T1 do começo ao fim, ou repita o passo 0.
+4. **Três terminais** abertos em `fcg-orchestration` (T1 = comandos, T2 = `kubectl get -n default ... -w` / gerador de tráfego, T3 = `port-forward`), todos com `$env:FCG_DEMO_SENHA` e `$env:FCG_DEMO_JOGO` definidas. O **diretório de sessão** que guarda os corpos de requisição nasce no passo 0 do bloco 2 e é apagado no fechamento (bloco 6) — mantenha o T1 do começo ao fim, ou repita o passo 0.
 5. **Navegador preparado:** deixe as abas já posicionadas antes de gravar (o Grafana e o Prometheus só respondem depois que os `port-forward` dos blocos 3 e 4 subirem — deixe-os ativos até o fim, sem reabrir):
    - Grafana — `http://localhost:13000` (login `admin` e a senha do Secret `grafana-admin`);
    - Prometheus — `http://localhost:19090/targets`;
@@ -71,7 +73,7 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 - "O **MongoDB** guarda as avaliações dos jogos e o **Redis** é o cache de leitura do catálogo — o SQL Server continua dono do dado transacional."
 - "A observabilidade é a **Opção A**: Prometheus coletando os três `/metrics`, Grafana com os dashboards e **Loki** centralizando os logs — inclusive os da função, que não tem pod permanente."
 
-**Comandos:** nenhum. (Se quiser um comando de contexto: `kubectl get pods` — 11 pods.)
+**Comandos:** nenhum. (Se quiser um comando de contexto: `kubectl get -n default pods` — 11 pods.)
 
 ## Bloco 2 — 0:45–3:00: Gateway: roteamento e segurança
 
@@ -85,7 +87,7 @@ $dirDemo = Join-Path $env:TEMP ('fcg-demo-' + (Get-Date -Format 'HHmmss'))
 New-Item -ItemType Directory -Path $dirDemo -Force | Out-Null
 
 # 1) O Service do gateway: LoadBalancer publicando SO a porta 8000
-kubectl get svc kong
+kubectl get -n default svc kong
 
 # 2) A rota protegida SEM token -> o proprio Kong responde 401 (a API nem e alcancada)
 curl.exe -i http://localhost:8000/api/jogos
@@ -115,13 +117,13 @@ curl.exe -s -o NUL -w 'com-token=%{http_code}\n' -H "Authorization: Bearer $toke
 
 ```powershell
 # 5) Admin API do Kong: rota /routes e plugin jwt — a prova do roteamento e da autenticacao
-kubectl port-forward deploy/kong 8001:8001
+kubectl port-forward -n default deploy/kong 8001:8001
 # T3 (outro terminal), com o forward ativo:
 curl.exe -s http://localhost:8001/routes
 curl.exe -s http://localhost:8001/plugins
 
 # 6) As APIs NAO sao expostas: users-api e catalog-api sao ClusterIP, so o Kong e LoadBalancer
-kubectl get svc users-api catalog-api kong
+kubectl get -n default svc users-api catalog-api kong
 ```
 
 **Na tela:** as rotas declaradas (`users-signup`, `users-login`, `catalog-jogos`, `catalog-biblioteca`, `users-protegida`), o plugin **`jwt`** com `key_claim_name: iss`, `claims_to_verify: ["exp"]` e `uri_param_names: []`, e a tabela de Services com **`ClusterIP`** em `users-api`/`catalog-api` contra **`LoadBalancer`** em `kong`.
@@ -138,14 +140,14 @@ kubectl get svc users-api catalog-api kong
 
 ```powershell
 # 1) Estado de repouso: 0 de 0 replicas e NENHUM pod — a escala a zero
-kubectl get deploy notifications-function
-kubectl get pods -l app=notifications-function
+kubectl get -n default deploy notifications-function
+kubectl get -n default pods -l app=notifications-function
 ```
 
 **T2 (deixe rodando durante o cadastro):**
 
 ```powershell
-kubectl get pods -l app=notifications-function -w
+kubectl get -n default pods -l app=notifications-function -w
 ```
 
 **T1 — o cadastro que acorda a função (e-mail NOVO a cada gravação):**
@@ -164,7 +166,7 @@ curl.exe -s -o NUL -w 'cadastro=%{http_code}\n' -X POST http://localhost:8000/ap
 **T3 — o log tem de aparecer na PLATAFORMA, não no terminal:**
 
 ```powershell
-kubectl port-forward svc/grafana 13000:3000
+kubectl port-forward -n default svc/grafana 13000:3000
 ```
 
 No navegador: `http://localhost:13000` → login `admin` → **Dashboards → FCG - Logs (Loki)** → painel `{app="notifications-function"}` → período **Last 5 minutes** → a linha:
@@ -177,13 +179,13 @@ No navegador: `http://localhost:13000` → login `admin` → **Dashboards → FC
 
 ```powershell
 # o cooldown do KEDA e de 30s: espere o pod terminar e a contagem voltar a zero
-kubectl get pods -l app=notifications-function
-kubectl get deploy notifications-function
+kubectl get -n default pods -l app=notifications-function
+kubectl get -n default deploy notifications-function
 ```
 
-**Na tela:** o `-w` do T2 mostrando o pod **`Terminating`** → nenhum recurso; e de volta o `0/0`. No Grafana, o log **continua lá** — o pod que o escreveu já não existe, e é exatamente para isso que o Loki existe (`kubectl logs` não sobrevive ao pod).
+**Na tela:** o `-w` do T2 mostrando o pod **`Terminating`** → nenhum recurso; e de volta o `0/0`. No Grafana, o log **continua lá** — o pod que o escreveu já não existe, e é exatamente para isso que o Loki existe (`kubectl logs -n default` não sobrevive ao pod).
 
-> **A espera de ~15–30 s pela função não é travamento: ela É a prova da escala a zero.** `kubectl logs` no caminho contrário (mostrar o log pelo terminal) provaria menos: o pod que registrou o `[EMAIL ENVIADO]` já não existe quando alguém vai ler, e o log tem de estar na plataforma centralizada. Narre a espera: "o KEDA consulta a fila a cada 15 s, e é por isso que o pod leva esse tempo para aparecer".
+> **A espera de ~15–30 s pela função não é travamento: ela É a prova da escala a zero.** `kubectl logs -n default` no caminho contrário (mostrar o log pelo terminal) provaria menos: o pod que registrou o `[EMAIL ENVIADO]` já não existe quando alguém vai ler, e o log tem de estar na plataforma centralizada. Narre a espera: "o KEDA consulta a fila a cada 15 s, e é por isso que o pod leva esse tempo para aparecer".
 
 ## Bloco 4 — 5:15–7:30: Observabilidade (Opção A)
 
@@ -196,8 +198,8 @@ powershell -ExecutionPolicy Bypass -File scripts/demo-trafego.ps1 -Segundos 90
 **T3 — os painéis:**
 
 ```powershell
-kubectl port-forward svc/grafana 13000:3000
-kubectl port-forward svc/prometheus 19090:9090
+kubectl port-forward -n default svc/grafana 13000:3000
+kubectl port-forward -n default svc/prometheus 19090:9090
 ```
 
 **No navegador, nesta ordem:**
@@ -253,13 +255,13 @@ curl.exe -s -H "Authorization: Bearer $token" ("http://localhost:8000/api/jogos/
 ```powershell
 curl.exe -s -o NUL -w 'catalogo=%{http_code}\n' -H "Authorization: Bearer $token" http://localhost:8000/api/jogos
 
-kubectl exec deploy/redis -- redis-cli keys 'catalog:*'
-kubectl exec deploy/redis -- redis-cli type catalog:games:all   # hash (o IDistributedCache grava HSET, nao SET)
-kubectl exec deploy/redis -- redis-cli ttl catalog:games:all    # ate 60
-kubectl exec deploy/redis -- redis-cli hlen catalog:games:all   # 3 (data, absexp, sldexp)
+kubectl exec -n default deploy/redis -- redis-cli keys 'catalog:*'
+kubectl exec -n default deploy/redis -- redis-cli type catalog:games:all   # hash (o IDistributedCache grava HSET, nao SET)
+kubectl exec -n default deploy/redis -- redis-cli ttl catalog:games:all    # ate 60
+kubectl exec -n default deploy/redis -- redis-cli hlen catalog:games:all   # 3 (data, absexp, sldexp)
 
 # Cache hit/miss vistos pelo proprio Prometheus (a serie tem o nome cru, sem sufixo _total):
-kubectl get --raw '/api/v1/namespaces/default/services/catalog-api:80/proxy/metrics' | Select-String '^cache_(hit|miss)'
+kubectl get -n default --raw '/api/v1/namespaces/default/services/catalog-api:80/proxy/metrics' | Select-String '^cache_(hit|miss)'
 ```
 
 **Na tela:** `catalogo=200`, as chaves `catalog:games:all` (e `catalog:game:{id}` quando o `GET` por id é exercitado pelo gerador), `type` = **`hash`** — `GET` na chave devolveria `WRONGTYPE`, porque o `IDistributedCache` grava hash, não string —, `ttl` ≤ 60 e as linhas `cache_hit`/`cache_miss` com valores crescentes.
@@ -288,11 +290,11 @@ kubectl get --raw '/api/v1/namespaces/default/services/catalog-api:80/proxy/metr
 
 ```powershell
 # 1) Secrets (os valores sao SEUS; nada de credencial no repositorio):
-kubectl create secret generic sqlserver-secret --from-literal=sa-password='<senha-do-sa>' --dry-run=client -o yaml | kubectl apply -f -
+kubectl create -n default secret generic sqlserver-secret --from-literal=sa-password='<senha-do-sa>' --dry-run=client -o yaml | kubectl apply -n default -f -
 #    ... (os Secrets das APIs, do Grafana, do Mongo e do RabbitMQ — secao "Segredos" do README)
 
 # 2) Manifestos: infraestrutura, APIs, Mongo, Redis, Prometheus, Grafana, Loki e Promtail
-kubectl apply -f k8s/
+kubectl apply -n default -f k8s/
 
 # 3) Gateway: renderiza a chave JWT do Secret, recria o kong-declarative-config e espera o rollout
 powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1

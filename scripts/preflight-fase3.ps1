@@ -20,24 +20,29 @@
 #   P8  KEDA: as tres filas notifications-* existem no broker e o ScaledObject esta Ready=True
 #       (sem fila, o KEDA cai em TriggerError e a funcao SIMPLESMENTE NAO SOBE: falha silenciosa)
 #   P9  DADOS DE DEMONSTRACAO: pelo menos 3 jogos no catalogo; se faltar, promove o usuario de
-#       demonstracao a Admin direto no SQL Server (o SQL vai por STDIN para /tmp do pod e o sqlcmd le
-#       com -i -- NENHUMA aspas interna no kubectl exec, que o Windows nao preserva; a senha vem do
-#       $SA_PASSWORD do ambiente do container), refaz o login e cria os jogos que faltam. Depois le a
-#       biblioteca do usuario (GET /api/biblioteca/{userId}) e escolhe o JOGO DO BLOCO 4: o primeiro
-#       do catalogo que o usuario ainda NAO possui (o catalogo volta ordenado por nome e a biblioteca
-#       cresce a cada rodada -- "o primeiro id do catalogo" daria 400 na compra do video)
+#       demonstracao a Admin (SQL por STDIN para /tmp do pod + "sqlcmd -i" -- NENHUMA aspas interna no
+#       kubectl exec, que o PowerShell 5.1 entrega picado e o sqlcmd receberia truncado; a senha vem do
+#       $SA_PASSWORD do ambiente do container) e CONFERE o Role lido do banco depois do UPDATE, porque
+#       o login responde 200 com qualquer role e um UPDATE sem efeito so apareceria no POST de jogo.
+#       Depois refaz o login, cria os jogos que faltam, le a biblioteca do usuario
+#       (GET /api/biblioteca/{userId}) e escolhe o JOGO DO BLOCO 4: o primeiro do catalogo que o
+#       usuario ainda NAO possui (o catalogo volta ordenado por nome e a biblioteca cresce a cada
+#       rodada -- "o primeiro id do catalogo" daria 400 na compra do video)
 #   P10 Redis com as chaves catalog:* e o Mongo respondendo (GET .../avaliacoes = 200)
 #   P10b os comandos que SO aparecem no video sao exercitados aqui: as series dos paineis em
-#       /metrics (proxy do kubectl, sem port-forward), a compra (so 202 e [OK]: e a compra ACEITA
-#       que move o painel de pagamentos -- e ela usa OUTRO jogo, para nao consumir o do bloco 4) e o
-#       PUT/GET de avaliacao (upsert: 201 na 1a, 200 na 2a) no jogo do bloco 4
+#       /metrics (proxy do kubectl, sem port-forward), a compra de verificacao -- que usa OUTRO jogo,
+#       para nao consumir o do bloco 4, e so 202 e [OK]: 400/409 sao re-execucao (ATENCAO, nao conta) e
+#       QUALQUER outro codigo (401/403/5xx/000) REPROVA -- e o PUT/GET de avaliacao (upsert: 201 na 1a,
+#       200 na 2a) no jogo do bloco 4
 #   P11 FUNCAO EM 0 REPLICAS (estado inicial da demo), esperando o cooldown do KEDA se preciso
 #
-# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os tres casos de ATENCAO
-# (log da funcao ainda ausente no Loki, compra recusada por posse e biblioteca que nao respondeu 200)
-# NAO emitem [OK] e NAO incrementam o contador -- por isso o total varia de 48 a 53 conforme o que o
-# cluster devolve: 51 no caminho ideal, +2 se o preflight precisar promover o usuario a Admin, e -1
-# por cada ATENCAO (ver a tabela de cenarios no relatorio).
+# CONTAGEM: "checagens" conta apenas PEDACOS QUE FORAM DE FATO VERIFICADOS. Os TRES casos de ATENCAO
+# (log da funcao ainda ausente no Loki, compra devolvendo 400/409 por posse, biblioteca devolvendo 404
+# por ainda nao existir) sao VARIACAO LEGITIMA DE ESTADO: NAO emitem [OK] e NAO incrementam o contador.
+# Todo o resto reprova -- generalizar "!= 202" ou "!= 200" para ATENCAO engoliria justamente os
+# codigos que denunciam um endpoint quebrado. O total varia de 48 a 54: 51 no caminho ideal, +3 se o
+# preflight precisar promover o usuario a Admin (secret, login e o Role lido do banco), e -1 por cada
+# ATENCAO (ver a tabela de cenarios no relatorio).
 #
 # Nada de port-forward: o Prometheus e o Loki sao alcancados pelo proxy do kubectl
 # (kubectl get --raw .../services/<svc>:<porta>/proxy/...) e o Grafana por kubectl exec + wget.
@@ -125,18 +130,34 @@ function SecretValor($nome, $chave) {
     if (-not $prop) { return $null }
     return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$prop.Value))
 }
-# Promove o usuario de demonstracao a Admin direto no SQL Server (o POST /api/jogos exige Admin).
-# O SQL vai por STDIN para /tmp DENTRO do pod e o sqlcmd le com -i: nenhuma aspas interna no
-# kubectl exec (o Windows nao as preserva -- ver a nota no P9) e a senha vem do $SA_PASSWORD que o
-# pod ja tem no ambiente. Devolve a saida do sqlcmd (para o chamador imprimir).
-function PromoverDemoAdmin($email) {
-    $sql = "UPDATE FCG_Users.dbo.Users SET Role = 1 WHERE Email = '" + $email + "'"
-    $sql | kubectl exec -i -n $namespace deploy/sqlserver -- sh -c 'cat > /tmp/promover.sql' 2>&1 | Out-Null
-    $saida = (San (((kubectl exec -n $namespace deploy/sqlserver -- sh -c '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD -C -i /tmp/promover.sql' 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
-    kubectl exec -n $namespace deploy/sqlserver -- sh -c 'rm -f /tmp/promover.sql' 2>&1 | Out-Null
+# Roda um SQL DENTRO do pod do SQL Server pela unica receita sem aspas internas: o texto vai por
+# STDIN para /tmp dentro do pod, o sqlcmd le com -i (e -h -1 quando so o valor interessa) e o arquivo
+# e removido no fim. A senha e o $SA_PASSWORD que o pod ja tem no ambiente -- nunca em argv.
+#
+# POR QUE ASSIM (defeito medido, duas vezes): a forma antiga, com a query entre aspas dentro do
+# argumento do shell e -Q, NAO funciona no Windows -- o PowerShell 5.1 entrega aquele argumento
+# PICADO em varios pedacos ao processo filho, o shell do container executa so o primeiro e o SQL vai
+# TRUNCADO ("... -C -Q UPDATE"), com o sqlcmd respondendo "Msg 102 ... Incorrect syntax near".
+# Nenhuma aspas interna aqui: o unico argumento do shell e o caminho do arquivo.
+function SqlNoPod($sql, [switch]$SomenteValor) {
+    $argsSqlcmd = '-C -i /tmp/fcg-preflight.sql'
+    if ($SomenteValor) { $argsSqlcmd = '-C -h -1 -i /tmp/fcg-preflight.sql' }
+    $sql | kubectl exec -i -n $namespace deploy/sqlserver -- sh -c 'cat > /tmp/fcg-preflight.sql' 2>&1 | Out-Null
+    $saida = (San (((kubectl exec -n $namespace deploy/sqlserver -- sh -c ('/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD ' + $argsSqlcmd) 2>&1) | ForEach-Object { [string]$_ }) -join "`n")).Trim()
+    kubectl exec -n $namespace deploy/sqlserver -- sh -c 'rm -f /tmp/fcg-preflight.sql' 2>&1 | Out-Null
     return $saida
 }
-function Pods($seletor) {    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
+# Promove o usuario de demonstracao a Admin (o POST /api/jogos exige Admin) e CONFERE o efeito pelo
+# mesmo caminho: sem isso, um SQL truncado deixaria o UPDATE sem efeito e o login continuaria
+# respondendo 200 (ele funciona com qualquer role) -- a falha so apareceria adiante, no POST de jogo.
+# Devolve @{ Saida = ...; Role = ... } para o chamador imprimir e checar.
+function PromoverDemoAdmin($email) {
+    $saida = SqlNoPod ("UPDATE FCG_Users.dbo.Users SET Role = 1 WHERE Email = '" + $email + "'")
+    $role = SqlNoPod ("SELECT Role FROM FCG_Users.dbo.Users WHERE Email = '" + $email + "'") -SomenteValor
+    return @{ Saida = $saida; Role = $role }
+}
+function Pods($seletor) {
+    return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\S' -and $_ -notmatch 'No resources found' })
 }
 function Prontos($seletor) {
     return @(kubectl get -n $namespace pods -l $seletor --no-headers 2>&1 | Where-Object { $_ -match '\s1/1\s+Running' }).Count
@@ -374,10 +395,9 @@ if ($jogos.Count -lt $JogosMinimos) {
     Write-Output '*** AVISO: faltam jogos para a demonstracao (o dado do SQL Server e volatil enquanto o ***'
     Write-Output '*** AVISO: PVC nao entrar: qualquer restart de container esvazia o banco). Criando agora. ***'
     # O POST /api/jogos exige Admin e a users-api registra todos como Usuario: promocao direta no SQL.
-    # A promocao usa PromoverDemoAdmin(): o SQL vai por STDIN -> /tmp/promover.sql -> "sqlcmd -i" ->
-    # "rm -f". A forma antiga (a query entre aspas dentro do argumento do shell, com -Q) NAO funciona
-    # no Windows: as aspas internas se perdem na passagem de argumentos e o sqlcmd responde
-    # "Msg 102, Level 15, State 1 ... Incorrect syntax near 'SELECT'" -- medido no cluster.
+    # A promocao usa PromoverDemoAdmin(): SQL por STDIN -> /tmp -> "sqlcmd -i" -> "rm", sem aspas
+    # internas, e CONFERE o Role depois do UPDATE (um SQL truncado nao promoveria ninguem e o login
+    # continuaria 200, porque ele funciona com qualquer role).
     # A senha do sa nao entra em argv nenhum: o shell do container expande o $SA_PASSWORD que o pod ja
     # tem no ambiente (secretKeyRef do sqlserver-secret, em k8s/sqlserver-deployment.yaml).
     $sa = SecretValor 'sqlserver-secret' 'sa-password'
@@ -388,9 +408,11 @@ if ($jogos.Count -lt $JogosMinimos) {
         'NAO consegui ler o Secret sqlserver-secret/sa-password: o POST de jogo vai responder 403.'
     } else {
         $script:segredos += $sa
-        $saidaSql = PromoverDemoAdmin $Email
+        $promo = PromoverDemoAdmin $Email
         'promocao do usuario de demonstracao a Admin (sqlcmd -i dentro do pod, com $SA_PASSWORD do ambiente):'
-        $(if ($saidaSql) { '  ' + $saidaSql } else { '  (sem saida)' })
+        $(if ($promo.Saida) { '  ' + $promo.Saida } else { '  (sem saida)' })
+        'Role lido do SQL depois do UPDATE = [' + ($promo.Role -replace "`r?`n", ' ') + ']  (esperado 1)'
+        Chk ($promo.Role -match '(?m)^\s*1\s*$') 'promocao-role-1-no-sql'
         $token = Token
         Chk ([bool]$token) 'login-apos-promocao-a-Admin'
     }
@@ -421,19 +443,26 @@ $bib = Resposta ($Gateway + '/api/biblioteca/' + $userId) 'GET' $null $token
 'GET /api/biblioteca/{userId} = ' + $bib.Code + '  (a biblioteca do usuario demo)'
 $idsBiblioteca = @()
 # Mesma politica do rotulo do Loki: o predicado vai para o Chk (nunca uma constante -- o [OK] tem de
-# vir da verificacao, nao de uma constante). Sem 200, sai ATENCAO e a checagem NAO e contada.
+# vir da verificacao). E a mesma regra da compra: so a variacao LEGITIMA de estado vira ATENCAO --
+# 404 = "este usuario ainda nao tem biblioteca" (nada possuido, a escolha continua valida); qualquer
+# outro codigo (401/403/500/000) e FALHA de verdade, porque sem a biblioteca a escolha do jogo do
+# bloco 4 poderia mentir.
 $bibliotecaLida = ($bib.Code -eq '200')
+$bibliotecaVazia = ($bib.Code -eq '404')
 if ($bibliotecaLida) {
     Chk $bibliotecaLida 'biblioteca-do-usuario-200'
     $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
     'biblioteca do usuario demo = ' + $idsBiblioteca.Count + ' jogo(s): ' + $(if ($idsBiblioteca.Count -gt 0) { $idsBiblioteca -join ', ' } else { '(vazia)' })
+} elseif ($bibliotecaVazia) {
+    Write-Output 'ATENCAO: GET /api/biblioteca/{userId} respondeu 404: o usuario de demonstracao ainda nao'
+    Write-Output 'ATENCAO: tem biblioteca (nada possuido), entao a escolha abaixo cai no PRIMEIRO jogo do'
+    Write-Output 'ATENCAO: catalogo -- que nesse caso e o correto, porque ele nao possui nenhum.'
+    Write-Output '(esta situacao NAO entra na contagem de checagens: e estado legitimo, nao falha)'
 } else {
-    # Nao reprova (a escolha abaixo continua valida), mas sem a biblioteca a escolha pode cair em um
-    # jogo que o usuario ja possui -- entao isto NAO vira [OK] e NAO entra na contagem de checagens.
-    Write-Output ('ATENCAO: GET /api/biblioteca/{userId} respondeu ' + $bib.Code + ' -- nao consegui ler a')
-    Write-Output 'ATENCAO: biblioteca do usuario demo. A escolha abaixo cai no PRIMEIRO jogo do catalogo,'
-    Write-Output 'ATENCAO: que pode ja ser dele (compra 400 no bloco 4). Confira depois de gravar.'
-    Write-Output '(esta situacao NAO entra na contagem de checagens: a biblioteca nao foi lida)'
+    Write-Output ('FALHOU: GET /api/biblioteca/{userId} devolveu ' + $bib.Code + ' -- a biblioteca do usuario')
+    Write-Output 'FALHOU: de demonstracao nao pode ser lida, e sem ela a escolha do jogo do bloco 4 pode'
+    Write-Output 'FALHOU: cair em um jogo que ele ja possui (compra 400 no video).'
+    Chk $false 'biblioteca-do-usuario-200'
 }
 $jogoDemo = $null
 $jogoDemoNome = ''
@@ -463,8 +492,9 @@ while ((-not $jogoDemo) -and ($tentativaLivre -lt 3)) {
             if ($saExtra) {
                 $script:segredos += $saExtra
                 'POST recusado (' + $rExtra.Code + '): promovendo o usuario demo a Admin e tentando de novo'
-                $saidaExtra = PromoverDemoAdmin $Email
-                $(if ($saidaExtra) { '  ' + $saidaExtra } else { '  (sem saida)' })
+                $promoExtra = PromoverDemoAdmin $Email
+                $(if ($promoExtra.Saida) { '  ' + $promoExtra.Saida } else { '  (sem saida)' })
+                'Role lido do SQL depois do UPDATE = [' + ($promoExtra.Role -replace "`r?`n", ' ') + ']  (esperado 1)'
                 $token = Token
                 $rExtra = Resposta ($Gateway + '/api/jogos') 'POST' $bExtra $token
                 'POST /api/jogos (apos a promocao) = ' + $rExtra.Code + '  (esperado 201)'
@@ -523,19 +553,30 @@ if ($userId -and $jogoVerificacao) {
     $rCompra = Resposta ($Gateway + '/api/jogos/' + $jogoVerificacao + '/comprar') 'POST' $bCompra $token
     'POST /api/jogos/{id}/comprar = ' + $rCompra.Code + '  (esperado 202)  jogo de verificacao=' + $jogoVerificacao
     '  corpo = ' + $rCompra.Texto
-    # SO 202 e [OK]: e a compra ACEITA que publica OrderPlacedEvent e move o painel "Pagamentos
-    # processados por status" do bloco 4. 400/409 costumam ser "o usuario de demonstracao ja possui
-    # este jogo" (rodada anterior do preflight): nao impede gravar, mas entao NAO houve verificacao da
-    # compra -- sai ATENCAO e a checagem NAO e contada (nada de [OK] sem verificacao).
+    # Tres desfechos, e SO um deles e sucesso:
+    #   202        -> [OK]: e a compra ACEITA que publica OrderPlacedEvent e move o painel de pagamentos;
+    #   400 / 409  -> ATENCAO sem contar: re-execucao legitima (o usuario ja possui este jogo) e o jogo
+    #                 do bloco 4 nao e afetado, porque ele foi escolhido por NAO estar na biblioteca;
+    #   QUALQUER OUTRO (401, 403, 500, 000...) -> FALHOU de verdade: o endpoint de compra nao esta
+    #                 respondendo como esperado e o preflight NAO pode anunciar "pronto para gravar".
+    # Repare no rigor: generalizar o "!= 202" para ATENCAO engoliria justamente os codigos que
+    # denunciam um endpoint quebrado -- so a variacao LEGITIMA de estado vira ATENCAO.
     $compraAceita = ($rCompra.Code -eq '202')
+    $compraReexecucao = (@('400', '409') -contains $rCompra.Code)
     if ($compraAceita) {
         Chk $compraAceita 'compra-aceita-202'
+    } elseif ($compraReexecucao) {
+        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' (o usuario de demonstracao')
+        Write-Output 'ATENCAO: ja possui ESTE jogo). O bloco 4 do video NAO e afetado: o jogo dele foi'
+        Write-Output 'ATENCAO: escolhido no P9 justamente por NAO estar na biblioteca. O que se perde aqui e'
+        Write-Output 'ATENCAO: apenas a evidencia de que o fluxo de pagamento responde 202 nesta rodada.'
+        Write-Output '(esta situacao NAO entra na contagem de checagens: e re-execucao, nao falha)'
     } else {
-        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' em vez de 202 (o usuario')
-        Write-Output 'ATENCAO: de demonstracao ja possui ESTE jogo). O bloco 4 do video NAO e afetado: o jogo'
-        Write-Output 'ATENCAO: dele foi escolhido no P9 justamente por NAO estar na biblioteca. O que se perde'
-        Write-Output 'ATENCAO: aqui e apenas a evidencia de que o fluxo de pagamento responde 202 nesta rodada.'
-        Write-Output '(esta situacao NAO entra na contagem de checagens: a compra nao foi aceita)'
+        Write-Output ('FALHOU: a compra devolveu ' + $rCompra.Code + ' -- isso NAO e re-execucao (400/409):')
+        Write-Output 'FALHOU: o endpoint POST /api/jogos/{id}/comprar nao esta respondendo como esperado'
+        Write-Output 'FALHOU: (401 = token recusado, 403 = sem permissao, 5xx/000 = servico ou gateway fora).'
+        Write-Output 'FALHOU: o bloco 4 do video depende deste endpoint.'
+        Chk $false 'compra-aceita-202'
     }
 } else {
     'sem userId no token ou sem jogo de verificacao: a compra do bloco 4 do video nao pode ser exercitada'
