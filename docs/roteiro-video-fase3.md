@@ -6,14 +6,14 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 
 | Tempo | Bloco | Na tela |
 |---|---|---|
-| 0:00–0:45 | **Abertura e arquitetura** | README aberto na seção *Arquitetura* + diagrama de fluxo de eventos; 1 frase por componente (Kong, 3 APIs, função, Mongo, Redis, Prometheus/Grafana/Loki) |
-| 0:45–3:00 | **Gateway: roteamento e segurança** | `kubectl get -n default svc kong` (Service do gateway) → `curl.exe -i http://localhost:8000/api/jogos` (**401**) → `curl.exe -X POST http://localhost:8000/api/auth/login -d '{...}'` (**200** + token) → `curl.exe -H "Authorization: Bearer <token>" .../api/jogos` (**200**) → `kubectl port-forward -n default deploy/kong 8001:8001` + `curl.exe localhost:8001/routes` (mostra as rotas) e a config DB-less com o plugin `jwt`; fechar mostrando que `svc/users-api` é `ClusterIP` (API não exposta) |
-| 3:00–5:15 | **Função serverless + log centralizado** | `kubectl get -n default deploy notifications-function` (**0/0**) → `kubectl get -n default pods -l app=notifications-function -w` em um terminal → cadastro pelo gateway (`201`) → **pod sobe em ~15–30 s** → Grafana `FCG - Logs (Loki)` com `[EMAIL ENVIADO] Boas-vindas para ...` (o log aparece **na plataforma**, não no terminal) → pod volta a zero |
-| 5:15–7:30 | **Observabilidade (Opção A)** | `scripts/demo-trafego.ps1 -Segundos 90` rodando em um terminal + dashboard `FCG - APIs` em tela cheia (latência p50/p95, RPS, status code, erros, `up`) → Prometheus `Status → Targets` com **3 alvos `up`** → painel *Pagamentos processados por status* mexendo após uma compra |
-| 7:30–9:15 | **NoSQL na arquitetura** | `PUT /api/jogos/{id}/avaliacoes` (upsert devolve o documento persistido) → `GET /api/jogos/{id}/avaliacoes` (lista vinda do Mongo) → `kubectl exec -n default deploy/redis -- redis-cli keys 'catalog:*'` + `type`/`ttl` → contadores `cache_hit`/`cache_miss`; explicar **por que** Mongo (documento flexível de avaliação) e **por que** Redis (cache de leitura com TTL 60 s), e que o SQL continua dono do dado transacional |
-| 9:15–10:00 | **Repositórios e fechamento** | tabela de repositórios do README (5 repos, incluindo o link da função) + a seção *Atendimento dos requisitos da Fase 3*; fechar com "como subir tudo": `kubectl create -n default secret ...` → `kubectl apply -n default -f k8s/` → `scripts/deploy-kong.ps1` |
+| 0:00–0:35 | **Abertura e arquitetura** | README aberto na seção *Arquitetura* + diagrama de fluxo de eventos; 1 frase curta por componente (Kong, 3 APIs, função, Mongo, Redis, Prometheus/Grafana/Loki) |
+| 0:35–2:50 | **Gateway: roteamento e segurança** | `kubectl get -n default svc kong` (Service do gateway) → `curl.exe -i http://localhost:8000/api/jogos` (**401**) → `curl.exe -X POST http://localhost:8000/api/auth/login -d '{...}'` (**200** + token) → `curl.exe -H "Authorization: Bearer <token>" .../api/jogos` (**200**) → `kubectl port-forward -n default deploy/kong 8001:8001` + `curl.exe localhost:8001/routes` (mostra as rotas) e a config DB-less com o plugin `jwt`; fechar mostrando que `svc/users-api` é `ClusterIP` (API não exposta) |
+| 2:50–5:05 | **Função serverless + log centralizado** | `kubectl get -n default deploy notifications-function` (**0/0**) → `kubectl get -n default pods -l app=notifications-function -w` em um terminal → cadastro pelo gateway (`201`) → **pod sobe em ~15–30 s** → Grafana `FCG - Logs (Loki)` com `[EMAIL ENVIADO] Boas-vindas para ...` (o log aparece **na plataforma**, não no terminal) → pod volta a zero |
+| 5:05–7:20 | **Observabilidade (Opção A)** | `scripts/demo-trafego.ps1 -Segundos 90` rodando em um terminal + dashboard `FCG - APIs` em tela cheia (latência p50/p95, RPS, status code, erros, `up`) → Prometheus `Status → Targets` com **3 alvos `up`** → painel *Pagamentos processados por status* mexendo após uma compra |
+| 7:20–8:55 | **NoSQL na arquitetura** | `PUT /api/jogos/{id}/avaliacoes` (upsert devolve o documento persistido) → `GET /api/jogos/{id}/avaliacoes` (lista vinda do Mongo) → `kubectl exec -n default deploy/redis -- redis-cli keys 'catalog:*'` + `type`/`ttl` → contadores `cache_hit`/`cache_miss`; **uma frase por banco** sobre o *porquê* (Mongo = documento de avaliação; Redis = cache de leitura com TTL 60 s; o SQL continua dono do transacional — o README detalha) |
+| 8:55–9:30 | **Repositórios e fechamento** | tabela de repositórios do README (5 repos, incluindo o link da função) + a seção *Atendimento dos requisitos da Fase 3*; fechar com "como subir tudo": `kubectl create -n default secret ...` → `kubectl apply -n default -f k8s/` → `scripts/deploy-kong.ps1` |
 
-**Soma dos tempos: 0:45 + 2:15 + 2:15 + 2:15 + 1:45 + 0:45 = 10:00.** O roteiro cabe no limite de 10 minutos com **zero folga** — se um bloco estourar, aplique a regra de corte do fim do documento (a primeira coisa a cair é o `port-forward` da Admin API do Kong, no bloco 2). Os blocos 3 e 4 têm **espera real** (o pod da função e o scrape de 15 s do Prometheus): narre durante a espera em vez de cortá-la — a espera é a evidência.
+**Soma dos tempos: 0:35 + 2:15 + 2:15 + 2:15 + 1:35 + 0:35 = 9:30.** O **alvo é 9:30 de conteúdo** e o **teto duro é 10:00** — o enunciado diz "até 10 minutos", então um vídeo de 10:01 descumpre o requisito: os **~30 s de folga** entre o alvo e o teto são o que absorve a narração e as esperas reais. Se ainda assim estiver passando do alvo, aplique a **regra de corte** do fim do documento (rede de segurança; a primeira coisa a cair é o `port-forward` da Admin API do Kong, no bloco 2) — e, em qualquer cenário, **feche antes de 10:00**. Os blocos 3 e 4 têm **espera real** (o pod da função e o scrape de 15 s do Prometheus): narre durante a espera em vez de cortá-la — a espera é a evidência.
 
 > **Namespace, em todo o roteiro:** cada comando `kubectl` leva **`-n default`** (o namespace onde a plataforma roda), e o caminho de proxy do kubectl carrega o namespace **dentro do próprio caminho** (`kubectl get --raw '/api/v1/namespaces/default/services/...'`). As duas formas apontam para o mesmo lugar — nada aqui depende do namespace do contexto, que pode estar em outro namespace sem que você perceba.
 
@@ -60,11 +60,11 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 - **Nunca mostrar o conteúdo do ambiente** (`Get-ChildItem env:`, `kubectl exec ... -- env`, `docker inspect`): `$env:FCG_DEMO_SENHA` apareceria em claro.
 - **Ao terminar, apague os temporários da sessão** (bloco 6, "higiene da sessão"): `Remove-Item $dirDemo -Recurse -Force` remove o diretório do passo 0 do bloco 2, que é o **único** lugar em que o roteiro grava corpo de requisição — e o corpo do login carrega a senha. Depois feche os terminais da gravação (`Clear-History` + fechar a janela): o token e a senha viveram só na memória daquela sessão. **Os dois scripts de apoio fazem a mesma limpeza**: o `preflight-fase3.ps1` e o `demo-trafego.ps1` montam o corpo do login num diretório temporário próprio (é o `-d @arquivo` do curl, que evita o JSON inline perder as aspas) e **removem o diretório inteiro no fim**, em todos os caminhos de saída (inclusive quando falham). Ou seja: nenhum artefato com senha — nem o do roteiro, nem o dos scripts — sobrevive à gravação.
 
-## Bloco 1 — 0:00–0:45: Abertura e arquitetura
+## Bloco 1 — 0:00–0:35: Abertura e arquitetura
 
 **Tela:** README (`README.md`) aberto na seção **Arquitetura**, com a tabela de serviços e o diagrama do **Fluxo de eventos** visíveis.
 
-**Narração (uma frase por componente, ~5 s cada):**
+**Narração (uma frase curta por componente, ~4 s cada — o bloco inteiro tem 35 s):**
 
 - "A plataforma FCG é composta por três microsserviços .NET 8 — UsersAPI, CatalogAPI e PaymentsAPI —, uma função serverless de notificações e um API Gateway Kong na frente de tudo."
 - "Todo o acesso externo entra pelo **Kong**; nenhuma API é publicada direto."
@@ -75,7 +75,7 @@ Estas regras valem para **todo** o vídeo — um descuido aqui vira credencial e
 
 **Comandos:** nenhum. (Se quiser um comando de contexto: `kubectl get -n default pods` — 11 pods.)
 
-## Bloco 2 — 0:45–3:00: Gateway: roteamento e segurança
+## Bloco 2 — 0:35–2:50: Gateway: roteamento e segurança
 
 **T1 (raiz de `fcg-orchestration`):**
 
@@ -134,7 +134,7 @@ kubectl get -n default svc users-api catalog-api kong
 
 **Narração:** "o Kong valida o JWT **no próprio gateway**: sem token a requisição recebe 401 e nunca chega à API; o `400` do login é de e-mail inexistente, e o `401` é senha errada — quem responde isso é a UsersAPI".
 
-## Bloco 3 — 3:00–5:15: Função serverless + log centralizado
+## Bloco 3 — 2:50–5:05: Função serverless + log centralizado
 
 **T1:**
 
@@ -187,7 +187,7 @@ kubectl get -n default deploy notifications-function
 
 > **A espera de ~15–30 s pela função não é travamento: ela É a prova da escala a zero.** `kubectl logs -n default` no caminho contrário (mostrar o log pelo terminal) provaria menos: o pod que registrou o `[EMAIL ENVIADO]` já não existe quando alguém vai ler, e o log tem de estar na plataforma centralizada. Narre a espera: "o KEDA consulta a fila a cada 15 s, e é por isso que o pod leva esse tempo para aparecer".
 
-## Bloco 4 — 5:15–7:30: Observabilidade (Opção A)
+## Bloco 4 — 5:05–7:20: Observabilidade (Opção A)
 
 **T2 — tráfego autenticado contínuo (90 s), no mesmo terminal do gerador:**
 
@@ -231,7 +231,7 @@ curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos
 
 **Narração — o ponto que costuma ser mal entendido:** "o `payments-api` **não recebe requisição nenhuma do gateway**: ele é consumidor de fila. Quem move o painel dele é o **fluxo de eventos** — cada compra publica `OrderPlacedEvent` e incrementa o contador de negócio `fcg_payments_processados_total`. E os painéis de tráfego **excluem as probes `/health`**: o número que aparece é tráfego de negócio, não probe."
 
-## Bloco 5 — 7:30–9:15: NoSQL na arquitetura
+## Bloco 5 — 7:20–8:55: NoSQL na arquitetura
 
 **T1 — avaliação no Mongo (o `PUT` é upsert):**
 
@@ -266,13 +266,15 @@ kubectl get -n default --raw '/api/v1/namespaces/default/services/catalog-api:80
 
 **Na tela:** `catalogo=200`, as chaves `catalog:games:all` (e `catalog:game:{id}` quando o `GET` por id é exercitado pelo gerador), `type` = **`hash`** — `GET` na chave devolveria `WRONGTYPE`, porque o `IDistributedCache` grava hash, não string —, `ttl` ≤ 60 e as linhas `cache_hit`/`cache_miss` com valores crescentes.
 
-**Narração — o "por quê" de cada escolha (é o requisito, não detalhe):**
+**Narração — o "por quê" de cada escolha (é o requisito, não detalhe). Com 1:35 de bloco, o alvo é UMA frase por banco; o resto é enfeite e o README já detalha:**
 
-- **Por que MongoDB:** a avaliação é **dado gerado pelo usuário, com formato variável** — `nota` obrigatória, `comentario` opcional e `tags[]` livre. Em modelo relacional isso vira coluna anulável mais tabela de tags, com junção a cada leitura, sem ganho de integridade; a leitura que importa é **agregada** (total e média) e a coleção é **um documento por avaliação**, com índice único `(gameId, userId)` criado no boot da API.
-- **Por que Redis:** `GET /api/jogos` devolve o **catálogo inteiro** sem paginação e é a consulta mais repetida — o lugar onde o cache rende mais. É **cache, não banco**: não tem PVC porque tudo nele é reconstruível do SQL, a degradação é **graciosa** (se o Redis cair, a leitura segue para o SQL) e as chaves têm **TTL de 60 s**, com invalidação explícita no `POST`/`DELETE` de jogo.
-- **O SQL continua dono do dado transacional:** usuários, catálogo e biblioteca seguem no SQL Server. O Mongo serve **apenas** as rotas `/avaliacoes` e o Redis **apenas** a leitura do catálogo — nenhum dado foi migrado para fora do SQL.
+- **Por que MongoDB (1 frase):** a avaliação é dado do usuário com formato variável — `nota` obrigatória, `comentario` opcional e `tags[]` livre —, e no relacional isso viraria coluna anulável mais tabela de tags, com junção a cada leitura; a leitura que importa é **agregada** (total e média).
+- **Por que Redis (1 frase):** `GET /api/jogos` devolve o **catálogo inteiro** sem paginação e é a consulta mais repetida; é **cache, não banco** — não tem PVC porque tudo nele é reconstruível do SQL e a degradação é **graciosa**.
+- **O SQL continua dono do dado transacional (1 frase):** usuários, catálogo e biblioteca seguem no SQL Server; o Mongo serve **apenas** as rotas `/avaliacoes` e o Redis **apenas** a leitura do catálogo — nada foi migrado para fora do SQL.
 
-## Bloco 6 — 9:15–10:00: Repositórios e fechamento
+> Se sobrar tempo aqui, os detalhes que valem a pena (e que ninguém vê na tela): o **TTL de 60 s** com invalidação explícita no `POST`/`DELETE` de jogo, o índice único `(gameId, userId)` criado no boot da API e o `WRONGTYPE` do `redis-cli GET`. Se faltar tempo, essas três frases são as primeiras a cair.
+
+## Bloco 6 — 8:55–9:30: Repositórios e fechamento
 
 **Tela 1 — os repositórios da entrega** (tabela da seção *Arquitetura* do README, mais este repositório de orquestração):
 
@@ -317,13 +319,15 @@ Test-Path $dirDemo      # False
 
 ## Se estourar o tempo (regra de corte)
 
-Corte **nesta ordem**, e só até caber em 10:00:
+A rede de segurança: o **alvo é 9:30** e o **teto duro é 10:00**, então há ~30 s de folga. Só se estiver passando de 9:30, corte **nesta ordem**:
 
 1. **primeiro** o `port-forward` da Admin API do Kong com `/routes` e `/plugins` (bloco 2) — o 401 sem token e o 200 com token já provam o gateway e a autenticação;
 2. depois o `GET /api/jogos/{id}/avaliacoes/resumo` e o `hlen` (bloco 5) — o documento do `PUT`, a lista do `GET` e o `keys`/`ttl` do Redis já provam a persistência poliglota e o cache;
 3. depois a segunda passada em `Status → Targets` (bloco 4), mantendo o dashboard `FCG - APIs` em tela e o painel de pagamentos mexendo.
 
 **Não corte:** o cadastro que acorda a função, a espera de ~15–30 s, o log da função **no Grafana** e a volta a zero — esse conjunto é o requisito de **serverless com escala a zero**, e é o bloco que mais depende de tempo real. Também não corte a seção *Atendimento dos requisitos da Fase 3* no fim: é o mapa que a banca usa para conferir o enunciado.
+
+> **Se nada disso bastar, corte no tempo da própria narração — nunca no último bloco inteiro.** Os três campos onde sobra gordura são: a **abertura** (o diagrama do README fala por si: uma frase por componente, sem repetir o que está escrito), o **porquê do NoSQL** (uma frase por banco; o README detalha) e o **fechamento** (mostre a tabela de repositórios e a seção de requisitos; o "como subir tudo" pode ficar só com os três comandos na tela). Os quatro itens que o enunciado exige demonstrar — **gateway**, **serverless com escala a zero**, **observabilidade** e **persistência poliglota com cache** — ficam inteiros.
 
 ## Apoio: o que o preflight garante para esta gravação
 
