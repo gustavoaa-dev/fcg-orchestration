@@ -36,14 +36,14 @@ Cada requisito da fase, onde ele está implementado e o comando que comprova —
 | Requisito | Onde está | Como comprovar |
 |---|---|---|
 | **API Gateway** | `k8s/kong/kong-deployment.yaml`, `k8s/kong/kong.yml.template`, `scripts/deploy-kong.ps1` | `curl.exe -i http://localhost:8000/api/jogos` → `401`; com token → `200` (ver [API Gateway](#api-gateway-kong)) |
-| **Função serverless (escala a zero)** | repositório [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function), implantada por Terraform + KEDA (`k8s/keda/README.md`) | `kubectl get pods -l app=notifications-function` → nenhum pod; um cadastro faz o pod subir (~15 s) e o log aparecer (ver [Serverless](#serverless-função-de-notificações)) |
-| **Observabilidade (Opção A: Prometheus + Grafana)** | `k8s/prometheus-*.yaml`, `k8s/grafana-*.yaml`, `k8s/loki-deployment.yaml` | dashboard `FCG - APIs` em tempo real e logs em `FCG - Logs (Loki)` (ver [Observabilidade](#observabilidade)) |
+| **Função serverless (escala a zero)** | repositório [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function), implantada por Terraform + KEDA (`k8s/keda/README.md`) | `kubectl get pods -l app=notifications-function` → nenhum pod; um cadastro faz o pod subir em **~15–30 s (pollingInterval de 15 s; medido 20–31 s)** e o log aparecer (ver [Serverless](#serverless-função-de-notificações)) |
+| **Observabilidade (Opção A: Prometheus + Grafana)** | `k8s/prometheus-*.yaml`, `k8s/grafana-*.yaml`, `k8s/loki-deployment.yaml`, `k8s/promtail-deployment.yaml` (o Promtail é o agente **DaemonSet** que coleta os logs dos pods e os envia ao Loki) | dashboard `FCG - APIs` em tempo real e logs em `FCG - Logs (Loki)` (ver [Observabilidade](#observabilidade)) |
 | **Persistência poliglota (NoSQL)** | `fcg-catalog-api` (`MongoDB.Driver`, `ReviewDocument`, `MongoReviewRepository`) | `PUT`/`GET /api/jogos/{id}/avaliacoes` (ver [Persistência poliglota e cache](#persistência-poliglota-e-cache)) |
 | **Cache distribuído (Redis)** | `fcg-catalog-api` (`CachedGameRepository`, `catalog:games:all`, `catalog:game:{id}`, TTL 60 s) | `kubectl exec deploy/redis -- redis-cli keys 'catalog:*'` e os contadores `cache_hit`/`cache_miss` no `/metrics` |
 | **Instrumentação nos microsserviços** | `prometheus-net` em `users-api`, `catalog-api` e `payments-api` | `kubectl port-forward svc/<api> 8080:80` + `curl.exe localhost:8080/metrics` |
-| **Segredos fora do repositório** | `.gitignore`, `.env.example`, seção [Segredos](#segredos) | `git grep -n 'FCG@Password123\|Fcg2024Test!'` → vazio |
+| **Segredos fora do repositório** | `.gitignore`, `.env.example`, seção [Segredos](#segredos) | `git grep -n -E 'FCG@Password123\|Fcg2024Test!' -- . ':!README.md'` → vazio (o `:!README.md` tira deste arquivo a própria linha de evidência: sem ela, o comando casaria consigo mesmo) |
 
-**Demonstração em vídeo:** *[link do vídeo]* — roteiro em [`docs/roteiro-video-fase3.md`](docs/roteiro-video-fase3.md).
+**Demonstração em vídeo:** *[link do vídeo — entra aqui após a publicação]* — roteiro em [`docs/roteiro-video-fase3.md`](docs/roteiro-video-fase3.md).
 
 ## Como executar com Docker
 
@@ -748,7 +748,7 @@ O requisito da fase é **serverless**, e o que o caracteriza é o comportamento 
 
 ### Como funciona
 
-- **Escala:** o KEDA observa o tamanho das filas `notifications-user-created` e `notifications-payment-processed` e escala o Deployment da função de **0 a 2** réplicas (`minReplicaCount: 0`, `maxReplicaCount: 2`, `pollingInterval: 15`, `cooldownPeriod: 30`). Medido em runtime: um **cadastro real pelo gateway** acordou a função em **~20-30s** (do cadastro até o pod ficar `Running` — **31s** na verificação final desta fase) e, passado o cooldown, ela **voltou a 0 réplicas**. É o tempo **observado** nas execuções desta fase, não uma latência prometida.
+- **Escala:** o KEDA observa o tamanho das filas `notifications-user-created` e `notifications-payment-processed` e escala o Deployment da função de **0 a 2** réplicas (`minReplicaCount: 0`, `maxReplicaCount: 2`, `pollingInterval: 15`, `cooldownPeriod: 30`). Medido em runtime: um **cadastro real pelo gateway** acordou a função em **~15–30 s (pollingInterval de 15 s; medido 20–31 s)** — do cadastro até o pod ficar `Running` (`31s` na verificação final desta fase) — e, passado o cooldown, ela **voltou a 0 réplicas**. É o tempo **observado** nas execuções desta fase, não uma latência prometida.
 - **Entrega:** chegando a mensagem, o RabbitMQ a entrega ao **`RabbitMQTrigger`** da função (`UserCreatedFunction` ou `PaymentProcessedFunction`) — não há chamada HTTP nesse caminho, a função é acordada pela fila.
 - **"Envio":** o efeito da função é **log estruturado**, com as mesmas mensagens do serviço removido — `[EMAIL ENVIADO] Boas-vindas para <Nome> - <email>` e `[EMAIL ENVIADO] Confirmação de compra para UserId: <guid>`. Medido no cadastro de evidência: `[EMAIL ENVIADO] Boas-vindas para Probe Escala Zero - escala194931@fcg.com`.
 
