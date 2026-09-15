@@ -48,9 +48,14 @@ CatalogAPI ──OrderPlacedEvent──→ PaymentsAPI (processa pagamento)
 # (a notificação não entra aqui: ela não é mais um container do Compose e sim uma
 #  função serverless, implantada no cluster pelo Terraform de fcg-notifications-function)
 
+# Credenciais locais: o Compose nao versiona senha nenhuma -- ele le do .env
+cp .env.example .env      # e troque os valores de SA_PASSWORD e JWT_SECRET
+
 cd fcg-orchestration
 docker-compose up -d
 ```
+
+> **O `.env` é obrigatório no caminho do Compose.** O `docker-compose.yml` lê `SA_PASSWORD` e `JWT_SECRET` do ambiente e **falha na hora**, com a mensagem `defina SA_PASSWORD no .env`, se eles não existirem — é de propósito: nenhuma credencial fica versionada. O `.env` está no `.gitignore` e o `.env.example` mostra as duas variáveis, a restrição de caracteres e por quê.
 
 ### Serviços e portas
 
@@ -60,7 +65,7 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 |---|---|---|
 | Kong (gateway) | `http://localhost:8000` | Único ponto de entrada das APIs (Kubernetes; ver [exposição por cluster](#expor-o-gateway-porta-de-entrada)) |
 | RabbitMQ Management | `http://localhost:15672` (guest/guest) | Infraestrutura de desenvolvimento |
-| SQL Server | `localhost:1433` (sa/FCG@Password123) | Infraestrutura de desenvolvimento |
+| SQL Server | `localhost:1433` (usuário `sa`, senha do `.env`) | Infraestrutura de desenvolvimento |
 | MongoDB | `ClusterIP:27017` | Avaliações dos jogos (Kubernetes): **não** é publicado pelo gateway; o acesso é por `kubectl port-forward svc/mongo 27017:27017` — ver [Persistência poliglota e cache](#persistência-poliglota-e-cache) |
 | Redis | `ClusterIP:6379` | Cache de leitura do catálogo (Kubernetes): **não** é publicado pelo gateway; o acesso é por `kubectl port-forward svc/redis 6379:6379` — ver [Persistência poliglota e cache](#persistência-poliglota-e-cache) |
 | Prometheus | `ClusterIP:9090` → `http://localhost:19090` | Observabilidade (Kubernetes): **não** é publicado pelo gateway; o acesso é por `port-forward` — ver [Observabilidade](#observabilidade) |
@@ -79,6 +84,81 @@ As APIs **não são publicadas diretamente**: o acesso é feito pelo gateway Kon
 ```bash
 docker-compose down
 ```
+
+## Segredos
+
+**Nenhuma credencial é versionada neste repositório.** Os manifestos guardam apenas o *nome* dos Secrets — os valores vivem só no cluster, criados por `kubectl create secret` — e o `.gitignore` ignora `k8s/*-secret.yaml` e `.env` para que um arquivo local não entre por engano.
+
+| Secret | Chaves | Quem consome | Como nasce |
+|---|---|---|---|
+| `sqlserver-secret` | `sa-password` | Deployment `sqlserver` | comando abaixo (**pré-requisito do apply**) |
+| `users-api-secret` | `connection-string`, `jwt-secret-key` | Deployment `users-api`; a chave JWT também é lida pelo Kong | comando abaixo (**pré-requisito do apply**) |
+| `catalog-api-secret` | `connection-string`, `jwt-secret-key` | Deployment `catalog-api` | comando abaixo (**pré-requisito do apply**) |
+| `payments-api-secret` | `connection-string` | Deployment `payments-api` | comando abaixo (**pré-requisito do apply**) |
+| `mongo-secret` | `root-username`, `root-password`, `connection-string` | Deployments `mongo` e `catalog-api` | [Subir o Mongo e o Redis](#subir-o-mongo-e-o-redis) |
+| `grafana-admin` | `admin-password` | Deployment `grafana` | [Subir a stack](#subir-a-stack) |
+| `kong-declarative-config` | `kong.yml` | Deployment `kong` | `scripts/deploy-kong.ps1`, que lê a chave JWT do `users-api-secret` |
+| `rabbitmq-connection` | `host` | `TriggerAuthentication`/`ScaledObject` da função de notificações | README de [fcg-notifications-function](https://github.com/gustavoaa-dev/fcg-notifications-function) |
+
+As APIs também **não** trazem credencial nos `appsettings.json`: a senha do SQL Server e a chave JWT chegam por `ConnectionStrings__DefaultConnection` e `Jwt__SecretKey`, e os comandos do EF (`dotnet ef`) leem a **mesma** variável — o padrão vale igual para o cluster e para a execução local.
+
+### Criar os Secrets do SQL Server e das APIs
+
+Os quatro Secrets abaixo são **pré-requisito do apply**: sem eles os Deployments ficam em `CreateContainerConfigError`. A senha é a **mesma** nos quatro (usuário `sa`) e a chave JWT é a **mesma** em `users-api`, `catalog-api` e Kong — a `users-api` **assina** o token, as outras duas **validam**.
+
+```powershell
+# 1) Senha do usuario sa do SQL Server
+kubectl create secret generic sqlserver-secret `
+  --from-literal=sa-password='<senha-do-sa>' `
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 2) users-api: string de conexao + chave JWT (quem assina o token)
+kubectl create secret generic users-api-secret `
+  --from-literal=connection-string='Server=sqlserver;Database=FCG_Users;User Id=sa;Password=<senha-do-sa>;TrustServerCertificate=True' `
+  --from-literal=jwt-secret-key='<chave-jwt>' `
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 3) catalog-api: string de conexao + a MESMA chave JWT (quem valida o token)
+kubectl create secret generic catalog-api-secret `
+  --from-literal=connection-string='Server=sqlserver;Database=FCG_Catalog;User Id=sa;Password=<senha-do-sa>;TrustServerCertificate=True' `
+  --from-literal=jwt-secret-key='<chave-jwt>' `
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 4) payments-api: apenas a string de conexao (ela nao valida JWT)
+kubectl create secret generic payments-api-secret `
+  --from-literal=connection-string='Server=sqlserver;Database=FCG_Payments;User Id=sa;Password=<senha-do-sa>;TrustServerCertificate=True' `
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+> **Restrição de caracteres:** use apenas letras, números, `-` e `_`. O `;` fecha a string de conexão — a senha sairia truncada, com um erro de login difícil de ler — e o `$` é interpretado pelo próprio Compose no caminho do `.env`. Uma chave de 32 bytes em base64url atende às duas regras.
+
+Depois do apply, o gateway ainda precisa do passo [Configurar o gateway](#configurar-o-gateway-segredo-jwt) para renderizar a chave JWT na configuração do Kong.
+
+### Trocar (rotacionar) os segredos
+
+Trocar a senha do `sa` **não** exige volume novo nem recriação do cluster: a senha vive no banco, e o `ALTER LOGIN` a troca no SQL Server em execução.
+
+```bash
+# 1) SQL Server: troque a senha do login ANTES de atualizar as strings de conexao
+kubectl exec deploy/sqlserver -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '<senha-antiga>' -C -Q "ALTER LOGIN sa WITH PASSWORD = '<senha-nova>'"
+
+# 2) Recrie os Secrets com os valores novos (comandos da secao anterior) e reinicie quem os le
+kubectl rollout restart deployment/users-api deployment/catalog-api deployment/payments-api
+
+# 3) Chave JWT nova? Em DB-less o Kong so rele a config declarativa no boot:
+powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1
+```
+
+> O pod do `sqlserver` **não** precisa reiniciar: `SA_PASSWORD` só tem efeito na primeira inicialização com o volume vazio — quem muda a senha do banco em uso é o `ALTER LOGIN`. O Secret `sqlserver-secret` continua valendo para um cluster novo (PVC vazio).
+
+A prova de que a rotação valeu é o contraste: um token emitido **antes** passa a responder `401` no gateway, e o login novo volta a responder `200`.
+
+```bash
+# token antigo -> 401; login novo -> 200 e o token novo volta a entrar
+curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer <token-antigo>" http://localhost:8000/api/jogos
+```
+
+**Sobre o histórico do git:** os valores que já foram versionados **foram rotacionados** — o que circulou está morto no cluster. O histórico não é reescrito de propósito (`force-push` é proibido neste projeto): a correção é remover o arquivo, rotacionar a credencial e não deixar rastro novo.
 
 ## Como fazer deploy no Kubernetes
 
@@ -110,10 +190,14 @@ docker build -t fcg-payments-api:latest .
 A **ordem importa**: primeiro a infraestrutura, as APIs e a observabilidade (com o `Secret` do Grafana antes do apply), depois o gateway Kong.
 
 ```bash
+# 0) Secrets: veja "Segredos" -- sqlserver-secret, users-api-secret, catalog-api-secret,
+#    payments-api-secret, grafana-admin e mongo-secret precisam existir ANTES deste apply,
+#    porque os Deployments os referenciam em secretKeyRef
+
 # 1) Infraestrutura (RabbitMQ, SQL Server), APIs e observabilidade (Prometheus, Grafana)
 kubectl apply -f k8s/
 
-# 2) Gateway Kong — depende do Secret users-api-secret, criado no passo 1
+# 2) Gateway Kong — depende do Secret users-api-secret (ver "Segredos")
 kubectl apply -f k8s/kong/kong-deployment.yaml
 ```
 
@@ -303,8 +387,11 @@ kubectl delete -f k8s/kong/kong-deployment.yaml
 kubectl delete -f k8s/
 # o Secret do Kong é criado pelo script, não pelos manifestos:
 kubectl delete secret kong-declarative-config
-# o Secret do Grafana também é criado à mão, não pelos manifestos:
-kubectl delete secret grafana-admin
+# os Secrets do Grafana, do Mongo, do RabbitMQ (KEDA) e das APIs também são criados à mão:
+kubectl delete secret grafana-admin mongo-secret rabbitmq-connection
+kubectl delete secret sqlserver-secret users-api-secret catalog-api-secret payments-api-secret
+# a credencial local do caminho do Compose (o arquivo não é versionado):
+Remove-Item .env
 ```
 
 > `kubectl delete -f k8s/` também remove o PVC `prometheus-data`: o histórico coletado pelo Prometheus vai junto (a retenção de 7 dias é descartada).
@@ -634,20 +721,19 @@ O `Service` e o `ConfigMap` sobrevivem ao `delete deployment`: nesta fase o `Ser
 
 ```
 fcg-orchestration/
+├── .env.example                      # credenciais locais: copie para .env (que fica fora do git)
+├── .gitignore                        # ignora .env e k8s/*-secret.yaml
 ├── docker-compose.yml
-├── k8s/
+├── k8s/                              # sem nenhum *-secret.yaml: os Secrets nascem de `kubectl create secret`
 │   ├── rabbitmq-deployment.yaml
 │   ├── sqlserver-deployment.yaml
 │   ├── mongo-deployment.yaml
 │   ├── redis-deployment.yaml
 │   ├── users-api-configmap.yaml
-│   ├── users-api-secret.yaml
 │   ├── users-api-deployment.yaml
 │   ├── catalog-api-configmap.yaml
-│   ├── catalog-api-secret.yaml
 │   ├── catalog-api-deployment.yaml
 │   ├── payments-api-configmap.yaml
-│   ├── payments-api-secret.yaml
 │   ├── payments-api-deployment.yaml
 │   ├── prometheus-configmap.yaml
 │   ├── prometheus-deployment.yaml

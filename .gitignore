@@ -1,0 +1,6 @@
+# Cofre local de credenciais -- nunca versionar (ver a secao "Segredos" do README).
+.env
+
+# Secrets do Kubernetes: nascem de `kubectl create secret`, nunca de arquivo aplicado.
+# Os manifestos guardam apenas o NOME dos Secrets, e os valores ficam no cluster.
+k8s/*-secret.yaml
