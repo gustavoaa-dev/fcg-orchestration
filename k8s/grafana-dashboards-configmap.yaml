@@ -90,6 +90,20 @@ data:
               "expr": "up{job=\"fcg-apis\"}"
             }
           ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Pagamentos processados por status",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+          "targets": [
+            {
+              "refId": "pagamentos",
+              "legendFormat": "{{status}}",
+              "expr": "sum by (status) (fcg_payments_processados_total)"
+            }
+          ]
         }
       ]
     }
