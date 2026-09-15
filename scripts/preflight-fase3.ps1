@@ -84,7 +84,8 @@
 #   Sem o parametro (-Modulo 0) o script e EXATAMENTE o de antes: as mesmas checagens e a mesma
 #   linha TUDO PRONTO PARA GRAVAR. O bloco do modo por modulo fica depois dos helpers e SAI do
 #   script quando termina, sem tocar em nenhuma linha do caminho completo.
-#   Os modulos 1 e 6 nao fazem login e por isso nao exigem FCG_DEMO_SENHA; os modulos 2 a 5 exigem.
+#   Os modulos que fazem login (2, 4 e 5) exigem FCG_DEMO_SENHA; os modulos 1, 3 e 6 nao fazem login
+#   (o modulo 3 le o cluster, mas quem usa a senha nele e a tomada, no cadastro) e por isso nao exigem.
 param(
     [string]$Gateway = 'http://localhost:8000',
     [string]$Email = 'demo@fcg.local',
@@ -304,9 +305,12 @@ function Token {
     return $null
 }
 
-# A senha so e exigida por quem faz login: o preflight completo e os modulos 2 a 5. Os modulos 1
-# (README + pods) e 6 (repositorios + evidencia de segredos) nao tocam em dado nenhum do cluster.
-$precisaSenha = (($Modulo -eq 0) -or (@(2, 3, 4, 5) -contains $Modulo))
+# A senha so e exigida por quem faz LOGIN: o preflight completo e os modulos 2, 4 e 5. Os modulos 1
+# (README + pods) e 6 (repositorios + evidencia de segredos) nao tocam em dado nenhum do cluster, e o
+# modulo 3 (KEDA, filas, Loki, Grafana e a escala a zero) LE o cluster mas NAO faz login: quem usa a
+# senha no modulo 3 e a TOMADA (o cadastro), nao o preparo -- exigir aqui seria pedir uma credencial que
+# o preparo nao usa, e a mensagem de erro ainda afirmava que ele fazia login.
+$precisaSenha = (($Modulo -eq 0) -or (@(2, 4, 5) -contains $Modulo))
 if ($precisaSenha -and (-not $Senha)) {
     Write-Output 'FALHOU: a senha da demonstracao nao foi informada.'
     Write-Output 'Defina a variavel de ambiente e rode de novo (a senha NUNCA e versionada):'
@@ -375,6 +379,7 @@ if ($Modulo -gt 0) {
     $script:tomadaToken = $null
     $script:tomadaJogoId = ''
     $script:tomadaJogoNome = ''
+    $script:tomadaJogoVerificacao = ''
     $script:tomadaJogos = @()
     $script:tomadaBiblioteca = @()
     $script:grafanaDatasources = @()
@@ -525,6 +530,51 @@ if ($Modulo -gt 0) {
             $script:tomadaJogoId = [string]$jogo
             $script:tomadaJogoNome = [string]$nome
         }
+    }
+
+    # Um jogo NOVO so para a COMPRA DE VERIFICACAO do modulo 4. Ele existe para o contador
+    # fcg_payments_processados_total ser provado SEMPRE: quando o usuario demo ja possui todos os jogos
+    # do catalogo nao sobra nenhum outro livre para a compra de verificacao (o jogo da TOMADA nao pode
+    # ser consumido aqui, porque a primeira compra daquele par e a que move o painel no video) -- sem
+    # este jogo o preparo liberaria a gravacao anunciando um contador que ele nao checou.
+    # Mesma mecanica do GarantirJogoLivre: o POST /api/jogos exige Admin e, se ele recusar, o preparo
+    # promove o usuario demo pelo SQL (por dentro do pod) e tenta de novo.
+    # CONTRATO: imprime as linhas e NAO devolve valor -- o id sai em $script:tomadaJogoVerificacao
+    # (devolver o id junto com as linhas impressas faria o PowerShell juntar tudo num array).
+    function CriarJogoParaVerificacao() {
+        $script:tomadaJogoVerificacao = ''
+        $selo = Get-Date -Format 'HHmmss'
+        $nomeVer = 'Jogo Demo Verificacao ' + $selo
+        'nao ha outro jogo LIVRE no catalogo para a compra de verificacao: criando um jogo NOVO'
+        $bVer = Body ('jogo-verificacao-' + $selo + '.json') ('{"nome":"' + $nomeVer + '","descricao":"Jogo livre para a compra de verificacao do preparo","preco":49.90}')
+        $rVer = Resposta ($Gateway + '/api/jogos') 'POST' $bVer $script:tomadaToken
+        'POST /api/jogos = ' + $rVer.Code + '  (esperado 201)  nome=' + $nomeVer
+        if ($rVer.Code -ne '201') {
+            $saVer = SecretValor 'sqlserver-secret' 'sa-password'
+            if ($saVer) {
+                $script:segredos += $saVer
+                'POST recusado (' + $rVer.Code + '): promovendo o usuario demo a Admin e tentando de novo'
+                $promoVer = PromoverDemoAdmin $Email
+                'Role lido do SQL depois do UPDATE = [' + ($promoVer.Role -replace "`r?`n", ' ') + ']  (esperado 1)'
+                $tNovoVer = Token
+                if ($tNovoVer) { $script:tomadaToken = $tNovoVer }
+                $rVer = Resposta ($Gateway + '/api/jogos') 'POST' $bVer $script:tomadaToken
+                'POST /api/jogos (apos a promocao) = ' + $rVer.Code + '  (esperado 201)'
+            } else {
+                'NAO consegui ler o Secret sqlserver-secret/sa-password: nao ha como promover o usuario'
+            }
+        }
+        if ($rVer.Code -ne '201') { return }
+        # O id e lido do CATALOGO (e nao do corpo do POST, que pode nao trazer o campo): o jogo recem
+        # criado e o unico com este nome, entao o id dele e confiavel.
+        $listaVer = Resposta ($Gateway + '/api/jogos') 'GET' $null $script:tomadaToken
+        $novosVer = @($listaVer.Body | Where-Object { $_ -ne $null -and ([string]$_.nome) -eq $nomeVer })
+        if ($novosVer.Count -ge 1) {
+            $script:tomadaJogoVerificacao = [string]$novosVer[0].id
+            'jogo da compra de verificacao = ' + $nomeVer + ' (' + $script:tomadaJogoVerificacao + ')'
+            return
+        }
+        'o jogo novo (' + $nomeVer + ') nao apareceu no GET /api/jogos: sem id nao ha o que comprar'
     }
 
     # As 3 filas do broker e o ScaledObject Ready (sem fila o KEDA cai em TriggerError e a funcao
@@ -701,8 +751,11 @@ if ($Modulo -gt 0) {
                 'servicos no Kong = ' + $(if ($servicosKong.Count -gt 0) { $servicosKong -join ', ' } else { '(nenhum)' })
                 'rotas no Kong = ' + $(if ($rotasKong.Count -gt 0) { $rotasKong -join ', ' } else { '(nenhum)' })
                 # Roteamento: quem expoe as APIs e o Kong. O payments-api NAO tem rota (ele e consumidor de
-                # fila) -- e essa ausencia e a evidencia de arquitetura que a tomada narra.
-                Chk (($rotasKong.Count -ge 1) -and ($configKong -notmatch 'payments-api')) 'kong-sem-rota-para-payments-api'
+                # fila) -- e essa ausencia e a evidencia de arquitetura que a tomada narra. O predicado olha
+                # a LINHA de declaracao ("- name: payments-api", em qualquer indentacao), nao a palavra
+                # solta: um comentario futuro no template citando o servico NAO pode reprovar o modulo 2
+                # com a mensagem enganosa de "ha rota para o payments-api".
+                Chk (($rotasKong.Count -ge 1) -and ($configKong -notmatch '(?m)^\s*- name: payments-api\s*$')) 'kong-sem-rota-para-payments-api'
                 # Seguranca: as rotas protegidas levam o plugin jwt (sem ele o 401 sem token nao existiria).
                 Chk ($configKong -match '(?m)^\s*- name: jwt') 'kong-com-plugin-jwt'
             } else {
@@ -771,54 +824,72 @@ if ($Modulo -gt 0) {
             $mPayments = Metricas 'payments-api:80'
             $temContador = [bool]($mPayments -match '(?m)^fcg_payments_processados_total')
             $alternativo = $null
-            $compraOk = $false
+            $codCompra = ''
+            # $semProva = true SO no desfecho 400/409 (re-execucao): e o unico em que a checagem do
+            # contador nao pode ser feita -- e uma situacao que, por regra do script, NAO conta checagem.
+            $semProva = $false
             if (-not $temContador) {
                 for ($i = $script:tomadaJogos.Count - 1; $i -ge 0; $i--) {
                     $idCand = [string]$script:tomadaJogos[$i].id
                     if ($idCand -and ($idCand -ne $jogoDaTomada) -and ($script:tomadaBiblioteca -notcontains $idCand.ToLower())) { $alternativo = $idCand; break }
                 }
+                if (-not $alternativo) { CriarJogoParaVerificacao; $alternativo = $script:tomadaJogoVerificacao }
                 if ($alternativo) {
                     $userId = Claim $token 'Id'
                     $bCompra = Body 'compra.json' ('{"userId":"' + $userId + '","gameId":"' + $alternativo + '"}')
                     $rCompra = Resposta ($Gateway + '/api/jogos/' + $alternativo + '/comprar') 'POST' $bCompra $token
-                    'compra de verificacao (jogo ' + $alternativo + ', OUTRO que o da tomada) = ' + $rCompra.Code + '  (esperado 202)'
-                    $compraOk = ($rCompra.Code -eq '202')
-                    if ($compraOk) {
+                    $codCompra = $rCompra.Code
+                    'compra de verificacao (jogo ' + $alternativo + ', OUTRO que o da tomada) = ' + $codCompra + '  (esperado 202)'
+                    if ($codCompra -eq '202') {
                         for ($k = 1; $k -le 6; $k++) {
                             Start-Sleep -Seconds 5
                             $mPayments = Metricas 'payments-api:80'
                             if ($mPayments -match '(?m)^fcg_payments_processados_total') { $temContador = $true; break }
                         }
-                        Chk ($rCompra.Code -eq '202') 'compra-aceita-202'
-                    } elseif (@('400', '409') -contains $rCompra.Code) {
-                        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' (o usuario demo ja possui')
+                    } elseif (@('400', '409') -contains $codCompra) {
+                        $semProva = $true
+                        Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $codCompra + ' (o usuario demo ja possui')
                         Write-Output 'ATENCAO: ESTE jogo). O jogo da tomada NAO e afetado (foi escolhido por estar livre) e o'
                         Write-Output 'ATENCAO: que se perde e a prova do 202 e do contador nesta rodada.'
                         Write-Output '(esta situacao NAO entra na contagem de checagens: e re-execucao, nao falha)'
-                    } else {
-                        Write-Output ('FALHOU: a compra de verificacao devolveu ' + $rCompra.Code + ' -- isso NAO e re-execucao (400/409):')
-                        Write-Output 'FALHOU: o endpoint POST /api/jogos/{id}/comprar nao esta respondendo como esperado'
-                        Write-Output 'FALHOU: (401 = token recusado, 403 = sem permissao, 5xx/000 = servico ou gateway fora).'
-                        Chk $false 'compra-aceita-202'
                     }
                 } else {
-                    Write-Output 'ATENCAO: nao ha outro jogo LIVRE no catalogo para a compra de verificacao (o jogo da'
-                    Write-Output 'ATENCAO: tomada nao pode ser consumido aqui) e o contador ainda nao esta no /metrics.'
-                    Write-Output '(esta situacao NAO entra na contagem de checagens: a compra DA TOMADA cria a familia)'
+                    Write-Output 'FALHOU: nao consegui criar um jogo livre para a compra de verificacao: sem ele o contador'
+                    Write-Output 'FALHOU: fcg_payments_processados_total nao pode ser provado antes de gravar.'
                 }
             }
             'contador fcg_payments_processados_total no /metrics do payments-api = ' + $temContador
-            if ($temContador) {
+            # UMA checagem por desfecho, e o predicado e o contador LIDO do /metrics (pode nao estar la:
+            # compra recusada, consumidor parado, jogo que nao deu para criar) -- nao ha Chk dentro do
+            # proprio ramo que garanta o predicado, e o 400/409 saiu acima sem contar checagem.
+            if (-not $semProva) {
                 Chk $temContador 'metrics-payments-api-contador-de-negocio'
-            } elseif ($compraOk) {
-                Write-Output 'FALHOU: a compra de verificacao foi ACEITA (202) e publicou o OrderPlacedEvent, mas o contador'
-                Write-Output 'FALHOU: fcg_payments_processados_total nao apareceu no /metrics do payments-api nem depois'
-                Write-Output 'FALHOU: de 30s: o painel "Pagamentos processados por status" ficaria sem serie na tomada.'
-                Chk $false 'metrics-payments-api-contador-de-negocio'
+                if (-not $temContador) {
+                    if ($codCompra -eq '202') {
+                        Write-Output 'FALHOU: a compra de verificacao foi ACEITA (202) e publicou o OrderPlacedEvent, mas o contador'
+                        Write-Output 'FALHOU: fcg_payments_processados_total nao apareceu no /metrics do payments-api nem depois'
+                        Write-Output 'FALHOU: de 30s: o painel "Pagamentos processados por status" ficaria sem serie na tomada.'
+                    } elseif ($codCompra) {
+                        Write-Output ('FALHOU: a compra de verificacao devolveu ' + $codCompra + ' -- isso NAO e re-execucao (400/409):')
+                        Write-Output 'FALHOU: o endpoint POST /api/jogos/{id}/comprar nao esta respondendo como esperado'
+                        Write-Output 'FALHOU: (401 = token recusado, 403 = sem permissao, 5xx/000 = servico ou gateway fora),'
+                        Write-Output 'FALHOU: e o contador ficou sem prova nesta rodada.'
+                    } else {
+                        Write-Output 'FALHOU: o contador nao esta no /metrics do payments-api e nenhuma compra de verificacao pode'
+                        Write-Output 'FALHOU: ser feita para cria-lo: o painel "Pagamentos processados por status" ficaria sem'
+                        Write-Output 'FALHOU: serie na tomada. Resolva a criacao do jogo (POST /api/jogos) e rode de novo.'
+                    }
+                }
             }
             if ($jogoDaTomada) {
                 'jogo do modulo 4 (compra) = ' + $jogoDaTomadaNome + ' (' + $jogoDaTomada + ')'
-                '  (nenhum outro jogo foi comprado aqui: a primeira compra DESTE par e a que move o painel na tomada)'
+                # A frase tem de dizer a VERDADE da rodada: no cluster frio houve, sim, uma compra aqui
+                # (a de verificacao, em OUTRO jogo) -- quem nao foi comprado e o jogo da tomada.
+                if ($codCompra) {
+                    '  (o jogo da tomada NAO foi comprado aqui: a primeira compra DESTE par e a que move o painel no video)'
+                } else {
+                    '  (nenhum outro jogo foi comprado aqui: a primeira compra DESTE par e a que move o painel na tomada)'
+                }
             }
         } elseif ($Modulo -eq 5) {
             Step 'MODULO 5 - NoSQL e cache: avaliacoes no Mongo e o Redis como cache de leitura'

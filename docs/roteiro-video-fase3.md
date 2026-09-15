@@ -24,22 +24,31 @@ A seção [Atendimento dos requisitos da Fase 3](../README.md#atendimento-dos-re
 
 ## Como gravar em módulos
 
-1. **Abra o capítulo do módulo** que vai gravar (por exemplo, `Módulo 2 — Gateway`) e siga **só ele**: cada capítulo tem o preparo, os comandos, a narração e o que fazer se der errado.
-2. **Rode o preparo daquele módulo** no terminal em que você vai gravar (o T1):
+1. **Antes da primeira tomada, rode o preflight completo uma vez** — **sem** o parâmetro, ele valida o cluster inteiro (pods, PVCs, gateway, Loki, Grafana, KEDA, dados de demonstração e a função em 0 réplicas) e é a execução única que precede a série de gravações:
+
+   ```powershell
+   $env:FCG_DEMO_SENHA = '<senha-da-demonstracao>'      # NAO versionada: so na sessao do terminal
+   powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1
+   ```
+
+   → no fim, `checagens=48..54  falhas=0` e a última linha **`TUDO PRONTO PARA GRAVAR`**. O total varia porque algumas checagens só existem quando há o que verificar (a promoção do usuário a Admin, o log da função no Loki, a compra de verificação); o que importa é **`falhas=0`**. Sem o `-Modulo`, como diz o fim da [seção de apoio](#apoio-o-que-o-preflight-garante), o script é o preflight completo de sempre — e ele **não** é obrigatório antes de cada tomada: quem garante o estado de cada módulo é o preparo `-Modulo N`.
+
+2. **Abra o capítulo do módulo** que vai gravar (por exemplo, `Módulo 2 — Gateway`) e siga **só ele**: cada capítulo tem o preparo, os comandos, a narração e o que fazer se der errado.
+3. **Rode o preparo daquele módulo** no terminal em que você vai gravar (o T1):
 
    ```powershell
    $env:FCG_DEMO_SENHA = '<senha-da-demonstracao>'      # NAO versionada: so na sessao do terminal
    powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1 -Modulo N
    ```
 
-   Cada `-Modulo N` **valida e prepara só o que aquela tomada precisa** e termina em **`TUDO PRONTO PARA GRAVAR O MODULO N`**. Se sair `PREFLIGHT REPROVADO ... NAO GRAVE ainda`, leia as linhas `[FALHOU]` acima, corrija e rode de novo (o script termina com `exit 1`). Os módulos 1 e 6 não fazem login e por isso não exigem a senha; de 2 a 5, sim. Sem o `-Modulo`, o script é o preflight completo de sempre (`TUDO PRONTO PARA GRAVAR`) — útil antes de começar a série de tomadas.
-3. **Confira que a tela está limpa** antes de apertar REC: nada de token, senha, `.env`, `kubectl get secret -o yaml` ou conteúdo do ambiente. As [regras de segurança](#regras-de-segurança-de-gravação) valem para **toda** tomada — um descuido em uma delas vira credencial exposta na entrega.
-4. **Grave o módulo** seguindo o *Passo a passo na tela* do capítulo, usando a *Narração sugerida* como fala. Limpe a tela (`Clear-Host`) no começo para o corte ficar limpo.
-5. **Pare a gravação e salve com o nome do módulo** (`modulo-2-gateway.mp4`), para a edição não depender de memória.
-6. **Feche o que a tomada abriu** — os `port-forward` (Ctrl+C) e a higiene do diretório de sessão que o próprio capítulo termina mostrando — e passe para o módulo seguinte. Os módulos seguintes assumem que as portas voltaram a ficar livres (o preparo de cada um checa isso).
-7. **Regrave quantas vezes quiser.** Cada módulo pode ser regravado do zero: rode **o preparo de novo** antes de cada retake, porque é ele que devolve o estado inicial daquela tomada. O caso mais claro é o da **compra**: o preparo garante (criando um jogo novo, se o usuário demo já possuir todos) um **jogo livre** e imprime o id a ser usado — repetir a compra do mesmo jogo devolveria `400` ("já possui este jogo") e o painel de pagamentos não se mexeria na tela.
+   Cada `-Modulo N` **valida e prepara só o que aquela tomada precisa** e termina em **`TUDO PRONTO PARA GRAVAR O MODULO N`**. Se sair `PREFLIGHT REPROVADO ... NAO GRAVE ainda`, leia as linhas `[FALHOU]` acima, corrija e rode de novo (o script termina com `exit 1`). Os módulos que fazem login (**2, 4 e 5**) exigem a senha; os módulos 1, 3 e 6 não fazem login e por isso não exigem (no **3** o preparo lê o cluster, mas quem usa a senha é a **tomada**, no cadastro).
+4. **Confira que a tela está limpa** antes de apertar REC: nada de token, senha, `.env`, `kubectl get secret -o yaml` ou conteúdo do ambiente. As [regras de segurança](#regras-de-segurança-de-gravação) valem para **toda** tomada — um descuido em uma delas vira credencial exposta na entrega.
+5. **Grave o módulo** seguindo o *Passo a passo na tela* do capítulo, usando a *Narração sugerida* como fala. Limpe a tela (`Clear-Host`) no começo para o corte ficar limpo.
+6. **Pare a gravação e salve com o nome do módulo** (`modulo-2-gateway.mp4`), para a edição não depender de memória.
+7. **Feche o que a tomada abriu** — os `port-forward` (Ctrl+C) e a higiene do diretório de sessão que o próprio capítulo termina mostrando — e passe para o módulo seguinte. Os módulos seguintes assumem que as portas voltaram a ficar livres (o preparo de cada um checa isso).
+8. **Regrave quantas vezes quiser.** Cada módulo pode ser regravado do zero: rode **o preparo de novo** antes de cada retake, porque é ele que devolve o estado inicial daquela tomada. O caso mais claro é o da **compra**: o preparo garante (criando um jogo novo, se o usuário demo já possuir todos) um **jogo livre** e imprime o id a ser usado — repetir a compra do mesmo jogo devolveria `400` ("já possui este jogo") e o painel de pagamentos não se mexeria na tela.
 
-**Onde ficam os segredos da sessão.** Cada módulo cria o **próprio diretório de sessão** (`$dirDemo`, no passo 0 do capítulo) e o **remove no fim dele**. É por tomada, de propósito: nenhum arquivo com senha em claro sobrevive à tomada que o criou, um retake não depende de nada do que veio antes, e o módulo 6 fecha o vídeo mostrando que **não sobrou nenhum diretório `fcg-demo-*`** no `%TEMP%` da máquina.
+**Onde ficam os segredos da sessão.** Cada módulo cria o **próprio diretório de sessão** (`$dirDemo`, no começo do *Passo a passo na tela* do capítulo — é o `# 0)` nos módulos 2, 3 e 5 e o `# 4)` no módulo 4, onde a tomada começa pelos painéis) e o **remove no fim dele**. É por tomada, de propósito: nenhum arquivo com senha em claro sobrevive à tomada que o criou, um retake não depende de nada do que veio antes, e o módulo 6 fecha o vídeo mostrando que **não sobrou nenhum diretório `fcg-demo-*`** no `%TEMP%` da máquina.
 
 ## Regras de segurança de gravação
 
@@ -174,6 +183,8 @@ TUDO PRONTO PARA GRAVAR O MODULO 2
 
 **Na tela, deixe pronto:** **dois terminais** abertos em `fcg-orchestration` — **T1** (o dos comandos, onde o preparo rodou e onde você vai digitar) e **T3** (o do `port-forward`, ocupado até o fim do módulo). O T1 precisa ter `$env:FCG_DEMO_SENHA` na sessão. `Clear-Host` nos dois antes de apertar REC.
 
+> **Não existe T2 neste módulo** — e isso é de propósito. A numeração dos terminais é fixa no roteiro inteiro, para você nunca ter de adivinhar qual janela é qual: o **T2** é o `kubectl get ... -w` do **módulo 3** e o **T3** é o `port-forward` (aqui o da Admin API do Kong, nos módulos 3 e 4 o do Grafana). Este módulo tem só dois papéis — comandos (T1) e a Admin API (T3) —, então o T2 fica vazio.
+
 ### Passo a passo na tela
 
 **T1 (raiz de `fcg-orchestration`):**
@@ -300,6 +311,8 @@ $env:FCG_DEMO_SENHA = '<senha-da-demonstracao>'
 powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1 -Modulo 3
 ```
 
+Este preparo **não faz login** e por isso **não exige a senha** (quem faz login são os módulos 2, 4 e 5). A variável continua na lista acima porque **a tomada** a usa: o cadastro do passo 2 entra com a senha por `$env:FCG_DEMO_SENHA`.
+
 Esperado no fim (é o estado com que a tomada começa):
 
 ```
@@ -309,7 +322,7 @@ filas do broker (rabbitmqctl list_queues name):       <- as tres filas notificat
 fila-notifications-user-created=True  [OK]
 fila-notifications-payment-processed=True  [OK]
 fila-notifications-dead-letter=True  [OK]
-ScaledObject notifications-function Ready=True  min=0 max=5
+ScaledObject notifications-function Ready=True  min=0 max=2
 scaledobject-Ready-True=True  [OK]
 loki /ready = ready  (esperado ready)
 loki-ready=True  [OK]
@@ -508,10 +521,13 @@ TUDO PRONTO PARA GRAVAR O MODULO 4
 $env:FCG_DEMO_JOGO = '<id-impresso-na-linha-jogo-do-modulo-4>'
 ```
 
-Duas variações possíveis, ambas impressas pelo preparo:
+Três variações possíveis, todas impressas pelo preparo (as duas últimas são as do **cluster frio**):
 
 - **o usuário demo já possui todos os jogos do catálogo** → ele imprime `todos os jogos do catalogo ja estao na biblioteca do usuario demo: criando mais um` + `POST /api/jogos = 201` e escolhe **esse** jogo novo (é o que permite regravar a tomada quantas vezes quiser);
-- **cluster frio, sem o contador de pagamentos** → ele faz uma **compra de verificação em OUTRO jogo livre** (`compra de verificacao (jogo <id>, OUTRO que o da tomada) = 202`) só para o contador `fcg_payments_processados_total` nascer no `/metrics` e espera até 30 s por ele; o jogo **da tomada não é tocado** (a primeira compra daquele par é a que move o painel no vídeo).
+- **cluster frio, sem o contador de pagamentos** → ele faz uma **compra de verificação em OUTRO jogo livre** (`compra de verificacao (jogo <id>, OUTRO que o da tomada) = 202`) só para o contador `fcg_payments_processados_total` nascer no `/metrics` e espera até 30 s por ele; o jogo **da tomada não é tocado** (a primeira compra daquele par é a que move o painel no vídeo). Nessa rodada a última linha sobre o jogo da tomada passa a ser `(o jogo da tomada NAO foi comprado aqui: a primeira compra DESTE par e a que move o painel no video)`, e não a do caso normal;
+- **cluster frio e sem nenhum outro jogo livre** (o demo possui todos e o preparo acabou de criar o da tomada) → ele **cria um jogo só para essa compra** (`nao ha outro jogo LIVRE no catalogo para a compra de verificacao: criando um jogo NOVO` + `POST /api/jogos = 201` + `jogo da compra de verificacao = …`) e compra esse. É por isso que o contador é **sempre** provado antes de liberar a gravação: o módulo anuncia o contador no *Esperado no fim* acima e não pode liberar uma tomada com ele por verificar.
+
+> O único caso em que a prova do contador **não** acontece é a compra de verificação devolvendo **`400`/`409`** (re-execução: o usuário já possui aquele jogo): aí o preparo avisa em `ATENCAO`, não conta checagem e segue — mas o esperado, quando isso aparece, é rodar `-Modulo 4` de novo até o contador aparecer no `/metrics`.
 
 **Na tela, deixe pronto:** **quatro terminais** em `fcg-orchestration` — **T1** (comandos: login e compra), **T2** (o gerador de tráfego), **T3** (`port-forward` do Grafana) e **T4** (`port-forward` do Prometheus) — mais **duas abas**: o Grafana em `http://localhost:13000` (logado) e o Prometheus em `http://localhost:19090/targets`. T1 com `$env:FCG_DEMO_SENHA` e `$env:FCG_DEMO_JOGO` e as telas limpas.
 
@@ -544,11 +560,11 @@ powershell -ExecutionPolicy Bypass -File scripts/demo-trafego.ps1 -Segundos 90
 3. **Volte ao Grafana** e mova o painel **Pagamentos processados por status** com uma **compra** (T1):
 
 ```powershell
-# 0) DIRETORIO DE SESSAO desta tomada (o corpo do login e o da compra carregam a senha/id)
+# 4) DIRETORIO DE SESSAO desta tomada (o corpo do login e o da compra carregam a senha/id)
 $dirDemo = Join-Path $env:TEMP ('fcg-demo-' + (Get-Date -Format 'HHmmss'))
 New-Item -ItemType Directory -Path $dirDemo -Force | Out-Null
 
-# A mesma funcao do modulo 2: esta sessao e nova, entao ela vem junto
+# 5) Login: a mesma funcao do modulo 2 -- esta sessao e nova, entao ela vem junto
 function Login-FCG {
     Set-Content -Path (Join-Path $dirDemo 'login.json') -Encoding ascii -NoNewline `
         -Value ('{"email":"demo@fcg.local","senha":"' + $env:FCG_DEMO_SENHA + '"}')
@@ -557,6 +573,8 @@ function Login-FCG {
 }
 $token  = Login-FCG
 'token recebido: ' + $token.Length + ' caracteres'
+
+# 6) A COMPRA que move o painel -- o passo seguinte aos paineis no ar:
 # O JOGO DESTA TOMADA nao e "o primeiro do catalogo": e o que o preparo IMPRIMIU na linha
 # "jogo do modulo 4 (compra) = <nome> (<id>)" e voce guardou em FCG_DEMO_JOGO antes de apertar REC
 # (o catalogo volta ordenado por NOME e a biblioteca do usuario demo cresce a cada rodada --
@@ -579,6 +597,7 @@ curl.exe -s -w 'compra=%{http_code}\n' -X POST ("http://localhost:8000/api/jogos
 **T1 — higiene e fim da tomada:**
 
 ```powershell
+# 7) HIGIENE DA TOMADA: os corpos de requisicao desta tomada (o do login tem a senha) saem da maquina
 Remove-Item $dirDemo -Recurse -Force
 Test-Path $dirDemo      # False
 # FIM: Ctrl+C nos port-forward do T3 e do T4 (liberam as portas 13000 e 19090)
@@ -630,7 +649,7 @@ $env:FCG_DEMO_SENHA = '<senha-da-demonstracao>'
 powershell -ExecutionPolicy Bypass -File scripts/preflight-fase3.ps1 -Modulo 5
 ```
 
-Esperado no fim:
+Esperado no fim (a contagem de checagens varia com o caminho do preparo — **8 a 10**; o que importa é `falhas=0`):
 
 ```
 === MODULO 5 - NoSQL e cache: avaliacoes no Mongo e o Redis como cache de leitura ===
@@ -639,7 +658,7 @@ usuario-de-demonstracao-login-200=True  [OK]
 token obtido: 79 caracteres (valor nunca e impresso)
 GET /api/jogos = 200  jogos no catalogo = 3
 catalogo-listagem-200=True  [OK]
-jogo da tomada = <nome do jogo> (<id>)  -- veio de FCG_DEMO_JOGO        <- quando a variavel existe
+jogo da tomada = <nome do jogo> (<id>)  -- veio de FCG_DEMO_JOGO        <- so no caminho COM a variavel
 jogo-da-tomada-definido=True  [OK]
 PUT /api/jogos/{id}/avaliacoes = 200  (esperado 201 na primeira, 200 na atualizacao)
 avaliacao-upsert-200-ou-201=True  [OK]
@@ -652,14 +671,17 @@ redis-cli type/ttl catalog:games:all = hash / 57  (esperado hash / ate 60)
 metrics-catalog-api-cache-hit=True  [OK]
 metrics-catalog-api-cache-miss=True  [OK]
 === RESULTADO ===
-modulo=5  checagens=8  falhas=0
+modulo=5  checagens=10  falhas=0
+                        <- 8 a 10, conforme o caminho do preparo: 10 quando ele REELEGE o jogo (o valor
+                           medido no cluster) e 8 quando FCG_DEMO_JOGO ja traz um id do catalogo.
+                           O que importa e falhas=0.
 TUDO PRONTO PARA GRAVAR O MODULO 5
   jogo do modulo 5 (avaliacoes) = <nome do jogo> (<id>)
   copie para a sessao da tomada: $env:FCG_DEMO_JOGO = '<id>'
   o PUT da tomada devolve 200 (upsert): este preparo ja gravou a avaliacao do demo neste jogo
 ```
 
-O preparo usa **o mesmo jogo do módulo 4** (`$env:FCG_DEMO_JOGO`, se o id ainda existir no catálogo). Se a variável não estiver definida nesta sessão — por exemplo, se você gravar o módulo 5 sem ter gravado o 4 — ele **reelege um jogo livre**, imprime o id e a linha `copie para a sessao da tomada: $env:FCG_DEMO_JOGO = '<id>'` (nesse caso o total de checagens sobe para 10). Copie o id para a sessão do T1 antes de apertar REC.
+O preparo usa **o mesmo jogo do módulo 4** (`$env:FCG_DEMO_JOGO`, se o id ainda existir no catálogo). Se a variável não estiver definida nesta sessão — por exemplo, se você gravar o módulo 5 sem ter gravado o 4 — ele **reelege um jogo livre**, imprime `FCG_DEMO_JOGO nao esta definido nesta sessao: reelegendo um jogo livre e imprimindo o id` (no lugar da linha `jogo da tomada = ... -- veio de FCG_DEMO_JOGO`) e fecha com a linha `copie para a sessao da tomada: $env:FCG_DEMO_JOGO = '<id>'`. É o caminho da linha `checagens=10` acima; com a variável definida o preparo fecha em **8**. Copie o id para a sessão do T1 antes de apertar REC.
 
 > Depois de gravar o módulo 4, aquele jogo **já pertence** ao usuário demo — e isso **não é problema aqui**: a avaliação é *upsert* por `(gameId, userId)` e não precisa de jogo livre. É por isso que o preparo do módulo 5 **não** exige um jogo livre, só que o id exista no catálogo.
 
@@ -814,7 +836,19 @@ TUDO PRONTO PARA GRAVAR O MODULO 6
    powershell -ExecutionPolicy Bypass -File scripts/deploy-kong.ps1
    ```
 
-3. **T1** — a higiene final da gravação (o fecho do ciclo de segredo, agora que **cada módulo** apagou o próprio diretório de sessão):
+3. **T1** — a **evidência de segredos** (a mesma linha da tabela *Segredos fora do repositório* do README, e a mesma checagem `evidencia-de-segredos-vazia` que o preparo do módulo 6 faz): a prova de que nenhuma credencial foi versionada é a **varredura vazia**:
+
+   ```powershell
+   # Os tres -e (nunca -E com alternancia e pipe escapado): um -e por padrao, e o resultado VAZIO e a prova.
+   # Os padroes vao MONTADOS por concatenacao de proposito: escritos inteiros, este proprio roteiro
+   # apareceria no resultado (o git grep varre o repositorio todo e so o README.md esta excluido, porque
+   # e ele que traz a linha da evidencia) -- o preflight-fase3.ps1 toma o mesmo cuidado.
+   git grep -n -E -e ('Password=' + 'FCG@') -e ('Fcg2024' + 'Test!') -e ('fcg-secret-key' + '-2024') -- . ':!README.md'
+   ```
+
+   → **nenhuma linha** (nem no roteiro nem em nenhum arquivo). Uma linha encontrada *é* a credencial: se aparecer alguma, **pare** e corrija antes de gravar.
+
+4. **T1** — a higiene final da gravação (o fecho do ciclo de segredo, agora que **cada módulo** apagou o próprio diretório de sessão):
 
    ```powershell
    # 1) alguma tomada deixou diretorio de sessao para tras? (so os NOMES, nunca o conteudo)
@@ -831,13 +865,14 @@ TUDO PRONTO PARA GRAVAR O MODULO 6
 
 - **(0:00–0:15, na tabela de repositórios)** "A entrega são cinco repositórios: a orquestração com os manifestos, o Kong e a observabilidade; as três APIs — UsersAPI, CatalogAPI e PaymentsAPI —; e a função de notificações, que é implantada pelo Terraform do repositório dela."
 - **(0:15–0:25, na seção de requisitos)** "E aqui está o mapa: cada requisito da fase, onde ele está implementado e o comando que comprova — na mesma ordem do vídeo."
-- **(0:25–0:35, nos comandos e na higiene final)** "Nenhuma credencial é versionada: os manifestos guardam só o **nome** dos Secrets e a configuração do Kong é um **template** com o marcador `${JWT_SECRET}`, renderizado pelo script a partir do que já está no cluster. A senha da demonstração viveu só na variável de ambiente da sessão, os diretórios de sessão das tomadas foram apagados e a varredura final mostra **zero**: nada com senha sobreviveu à gravação."
+- **(0:25–0:35, nos comandos, na evidência e na higiene final)** "Nenhuma credencial é versionada: os manifestos guardam só o **nome** dos Secrets e a configuração do Kong é um **template** com o marcador `${JWT_SECRET}`, renderizado pelo script a partir do que já está no cluster. Esta varredura do repositório pelos padrões de senha volta **vazia** — é isso que ela tem de mostrar. A senha da demonstração viveu só na variável de ambiente da sessão, os diretórios de sessão das tomadas foram apagados e a varredura final mostra **zero**: nada com senha sobreviveu à gravação."
 
 ### Como saber que deu certo
 
 - a tabela dos **5 repositórios** (incluindo o link do repositório da função) na tela;
 - a seção **Atendimento dos requisitos da Fase 3** mostrada na íntegra;
 - os três comandos de "como subir tudo" **sem nenhum valor de credencial** na tela (só `<placeholders>`);
+- a **evidência de segredos** (`git grep` com os três `-e`) devolvendo **vazio** — nenhuma linha na tela;
 - a varredura final imprimindo **`0`**;
 - nenhuma janela com `.env`, token ou `secret` aberto.
 
@@ -893,6 +928,6 @@ Antes de exportar, confira também: nenhuma cena com `.env`, token, senha ou `se
 
 No modo completo ele verifica, além dos pods, dos **4 PVCs `Bound`** e do gateway: os **três alvos do job `fcg-apis`** no Prometheus, o Loki `ready` e com log recente da stack (o log **da função** é `ATENÇÃO` quando o rótulo ainda não existe nas últimas 24 h — o cadastro do módulo 3 gera esse log ao vivo —; com o rótulo presente ele exige **linhas** de verdade), o datasource e os dois dashboards do Grafana, as **três filas `notifications-*`** com o `ScaledObject Ready=True` (sem fila o KEDA cai em `TriggerError` e a **função simplesmente não sobe** — falha silenciosa que só apareceria na gravação), o Redis com as chaves `catalog:*`, o Mongo respondendo, o **usuário e os jogos de demonstração** e a **função em 0 réplicas** no estado inicial.
 
-Sobre os dados de demonstração, ele garante **3 jogos** no catálogo, promove o usuário demo a Admin se precisar criar jogos (SQL por dentro do pod, digitado por **stdin**), **lê a biblioteca do usuário** (`GET /api/biblioteca/{userId}`) e escolhe/impressiona o **jogo da compra**: o primeiro do catálogo que o usuário **não** possui — é esse id que vai em `$env:FCG_DEMO_JOGO` e que os módulos 4 (compra) e 5 (avaliações) usam. A **compra de verificação** que ele faz usa **outro** jogo, de propósito: comprar o do vídeo consumiria a primeira compra daquele par (usuário, jogo), que é justamente a que devolve `202` e move o painel de pagamentos. Tudo isso o modo por módulo (`-Modulo 4` e `-Modulo 5`) faz **só com o que aquela tomada precisa** — inclusive recriando um jogo livre novo a cada execução, que é o que protege o **retake**.
+Sobre os dados de demonstração, ele garante **3 jogos** no catálogo, promove o usuário demo a Admin se precisar criar jogos (SQL por dentro do pod, digitado por **stdin**), **lê a biblioteca do usuário** (`GET /api/biblioteca/{userId}`) e escolhe/impressiona o **jogo da compra**: o primeiro do catálogo que o usuário **não** possui — é esse id que vai em `$env:FCG_DEMO_JOGO` e que os módulos 4 (compra) e 5 (avaliações) usam. A **compra de verificação** que ele faz usa **outro** jogo, de propósito: comprar o do vídeo consumiria a primeira compra daquele par (usuário, jogo), que é justamente a que devolve `202` e move o painel de pagamentos — e, se **não houver** outro jogo livre (o demo possui todos), o preparo do módulo 4 **cria um** só para essa compra, porque o contador `fcg_payments_processados_total` é anunciado no *Esperado no fim* daquela tomada e tem de estar provado antes de liberar a gravação. Tudo isso o modo por módulo (`-Modulo 4` e `-Modulo 5`) faz **só com o que aquela tomada precisa** — inclusive recriando um jogo livre novo a cada execução, que é o que protege o **retake**.
 
 Ele também **exercita os comandos que só aparecem no vídeo**: as séries dos painéis em `/metrics` (pelo proxy do `kubectl`), a **compra** (`202`) e o `PUT`/`GET` de **avaliação** (upsert) — assim nenhum módulo leva um comando que nunca rodou. `scripts/demo-trafego.ps1 -Segundos 90` é o gerador do módulo 4; os dois leem a senha de `$env:FCG_DEMO_SENHA` e **não** têm senha padrão no arquivo.
