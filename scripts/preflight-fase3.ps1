@@ -183,6 +183,18 @@ function Claim($token, $nome) {
     switch ($p.Length % 4) { 2 { $p += '==' } 3 { $p += '=' } }
     try { return (([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p)) | ConvertFrom-Json).$nome) } catch { return $null }
 }
+# Itens da biblioteca, ja sem o envelope: a resposta medida e uma LISTA DIRETA, mas o extrator aceita
+# tambem { "itens": [...] } / { "jogos": [...] } / { "biblioteca": [...] } / { "items": [...] }.
+# Usado para distinguir "lista vazia" (legitimo) de "tem itens e nenhum id reconhecido" (contrato).
+function ItensDaBiblioteca($corpo) {
+    if (-not $corpo) { return @() }
+    $lista = $corpo
+    foreach ($prop in @('itens', 'jogos', 'biblioteca', 'items')) {
+        $p = $corpo.PSObject.Properties[$prop]
+        if ($p -and $p.Value) { $lista = $p.Value; break }
+    }
+    return @($lista | Where-Object { $_ -ne $null })
+}
 # Ids dos jogos que o usuario tem na biblioteca. A resposta medida no cluster e uma LISTA DIRETA de
 # itens com o id no campo "gameId":
 #   [{"gameId":"7ed3f967-...","nome":"Elden Ring","descricao":"...","preco":199.90,"dataCompra":"..."}, ...]
@@ -191,17 +203,12 @@ function Claim($token, $nome) {
 # O extrator aceita: "gameId", "id", "jogoId", "game_id" e os aninhados "jogo.id"/"game.id", em
 # QUALQUER caixa (a comparacao de NOME e feita com ToLower, sem depender do indexador do PSObject), e
 # tambem uma lista de ids puros (["guid", "guid"]). Quando nada e reconhecido numa resposta com itens,
-# preenche $script:camposBiblioteca com os nomes de campo encontrados -- o chamador imprime isso, para
-# a proxima divergencia de contrato aparecer na hora em vez de virar uma escolha silenciosamente errada.
+# preenche $script:camposBiblioteca com os nomes de campo encontrados -- o chamador imprime isso e
+# REPROVA (nao basta o transporte ter respondido 200).
 function IdsDaBiblioteca($corpo) {
     $script:camposBiblioteca = ''
     if (-not $corpo) { return @() }
-    $lista = $corpo
-    foreach ($prop in @('itens', 'jogos', 'biblioteca', 'items')) {
-        $p = $corpo.PSObject.Properties[$prop]
-        if ($p -and $p.Value) { $lista = $p.Value; break }
-    }
-    $itens = @($lista | Where-Object { $_ -ne $null })
+    $itens = @(ItensDaBiblioteca $corpo)
     $ids = @()
     foreach ($item in $itens) {
         if ($item -is [string]) { $ids += $item; continue }
@@ -479,22 +486,26 @@ $idsBiblioteca = @()
 $bibliotecaLida = ($bib.Code -eq '200')
 $bibliotecaVazia = ($bib.Code -eq '404')
 if ($bibliotecaLida) {
-    Chk $bibliotecaLida 'biblioteca-do-usuario-200'
+    $itensBiblioteca = @(ItensDaBiblioteca $bib.Body)
     $idsBiblioteca = @(IdsDaBiblioteca $bib.Body | ForEach-Object { ([string]$_).ToLower() })
-    if ($idsBiblioteca.Count -gt 0) {
-        'biblioteca do usuario demo = ' + $idsBiblioteca.Count + ' jogo(s): ' + ($idsBiblioteca -join ', ')
+    # A checagem NAO pode dar [OK] so pelo transporte: 200 com itens e ZERO ids reconhecidos e QUEBRA
+    # DE CONTRATO (foi assim que a escolha errada saiu com a linha verde na rodada 2). Lista vazia e
+    # legitima: o usuario simplesmente nao possui nada.
+    $bibliotecaInterpretavel = ($itensBiblioteca.Count -eq 0) -or ($idsBiblioteca.Count -eq $itensBiblioteca.Count)
+    'biblioteca do usuario demo = ' + $itensBiblioteca.Count + ' item(ns), ' + $idsBiblioteca.Count + ' id(s) reconhecido(s)'
+    if ($bibliotecaInterpretavel) {
+        if ($itensBiblioteca.Count -gt 0) { 'ids da biblioteca = ' + ($idsBiblioteca -join ', ') }
+        else { '(lista vazia: o usuario nao possui nenhum jogo)' }
     } else {
-        'biblioteca do usuario demo = 0 jogo(s) reconhecido(s)'
-        # Diagnostico de contrato: mostra os campos que o item REALMENTE tem. Sem isto, um campo com
-        # nome diferente do esperado vira uma biblioteca "vazia" e a escolha do bloco 4 sai errada --
-        # foi exatamente o defeito da rodada 2 (o campo e "gameId").
+        Write-Output ('FALHOU: a biblioteca respondeu 200 com ' + $itensBiblioteca.Count + ' item(ns), mas a extracao')
+        Write-Output ('FALHOU: reconheceu ' + $idsBiblioteca.Count + ' id(s) -- quebra de contrato no corpo.')
         if ($script:camposBiblioteca) {
-            'campos do item da biblioteca: ' + $script:camposBiblioteca
-            Write-Output 'ATENCAO: a biblioteca respondeu 200 e tem itens, mas nenhum id foi reconhecido'
-            Write-Output ('ATENCAO: nos campos acima. O contrato medido no cluster usa "gameId". Se a lista')
-            Write-Output 'ATENCAO: de verdade estiver vazia, ignore; se nao estiver, a escolha abaixo mente.'
+            Write-Output ('FALHOU: campos do item da biblioteca: ' + $script:camposBiblioteca)
         }
+        Write-Output 'FALHOU: o contrato medido no cluster usa "gameId"; sem os ids a escolha do bloco 4'
+        Write-Output 'FALHOU: fica no escuro (foi o defeito da rodada 2).'
     }
+    Chk $bibliotecaInterpretavel 'biblioteca-do-usuario-200'
 } elseif ($bibliotecaVazia) {
     Write-Output 'ATENCAO: GET /api/biblioteca/{userId} respondeu 404: o usuario de demonstracao ainda nao'
     Write-Output 'ATENCAO: tem biblioteca (nada possuido), entao a escolha abaixo cai no PRIMEIRO jogo do'
@@ -642,9 +653,17 @@ if ($userId -and $jogoVerificacao) {
         Chk $compraAceita 'compra-aceita-202'
     } elseif ($compraReexecucao) {
         Write-Output ('ATENCAO: a compra de verificacao devolveu ' + $rCompra.Code + ' (o usuario de demonstracao')
-        Write-Output 'ATENCAO: ja possui ESTE jogo). O bloco 4 do video NAO e afetado: o jogo dele foi'
-        Write-Output 'ATENCAO: escolhido no P9 justamente por NAO estar na biblioteca. O que se perde aqui e'
-        Write-Output 'ATENCAO: apenas a evidencia de que o fluxo de pagamento responde 202 nesta rodada.'
+        Write-Output 'ATENCAO: ja possui ESTE jogo). O que se perde aqui e apenas a evidencia de que o fluxo de'
+        Write-Output 'ATENCAO: pagamento responde 202 nesta rodada.'
+        # A frase sobre o bloco 4 so pode ser afirmada se a POSSE foi de fato verificada nesta rodada
+        # (biblioteca lida e escolha conferida no P9): sem isso, ela orientaria mal o apresentador.
+        if ($bibliotecaLida) {
+            Write-Output 'ATENCAO: O bloco 4 do video NAO e afetado: o jogo dele foi escolhido no P9 por NAO estar'
+            Write-Output 'ATENCAO: na biblioteca do demo -- e essa posse foi VERIFICADA nesta rodada (biblioteca lida).'
+        } else {
+            Write-Output 'ATENCAO: a biblioteca NAO foi lida nesta rodada, entao a posse do jogo do bloco 4'
+            Write-Output 'ATENCAO: NAO foi verificada -- confira a biblioteca do demo antes de gravar.'
+        }
         Write-Output '(esta situacao NAO entra na contagem de checagens: e re-execucao, nao falha)'
     } else {
         Write-Output ('FALHOU: a compra devolveu ' + $rCompra.Code + ' -- isso NAO e re-execucao (400/409):')
