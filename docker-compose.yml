@@ -22,9 +22,9 @@ services:
       - "1433:1433"
     environment:
       ACCEPT_EULA: "Y"
-      SA_PASSWORD: "FCG@Password123"
+      SA_PASSWORD: "${SA_PASSWORD:?defina SA_PASSWORD no .env -- copie .env.example}"
     healthcheck:
-      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "FCG@Password123", "-C", "-Q", "SELECT 1"]
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "${SA_PASSWORD}", "-C", "-Q", "SELECT 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -39,8 +39,8 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
-      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Users;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
-      Jwt__SecretKey: "fcg-secret-key-2024-super-segura-256bits"
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Users;User Id=sa;Password=${SA_PASSWORD};TrustServerCertificate=True"
+      Jwt__SecretKey: "${JWT_SECRET:?defina JWT_SECRET no .env -- copie .env.example}"
       Jwt__Issuer: "FCG.UsersAPI"
       Jwt__Audience: "FCG.Client"
     depends_on:
@@ -59,8 +59,8 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
-      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Catalog;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
-      Jwt__SecretKey: "fcg-secret-key-2024-super-segura-256bits"
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Catalog;User Id=sa;Password=${SA_PASSWORD};TrustServerCertificate=True"
+      Jwt__SecretKey: "${JWT_SECRET:?defina JWT_SECRET no .env -- copie .env.example}"
       Jwt__Issuer: "FCG.UsersAPI"
       Jwt__Audience: "FCG.Client"
     depends_on:
@@ -79,7 +79,7 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       RABBITMQ_HOST: rabbitmq
-      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Payments;User Id=sa;Password=FCG@Password123;TrustServerCertificate=True"
+      ConnectionStrings__DefaultConnection: "Server=sqlserver;Database=FCG_Payments;User Id=sa;Password=${SA_PASSWORD};TrustServerCertificate=True"
     depends_on:
       rabbitmq:
         condition: service_healthy
