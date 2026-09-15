@@ -48,8 +48,16 @@ spec:
               value: "guest"
             - name: RABBITMQ_DEFAULT_PASS
               value: "guest"
-          # /var/lib/rabbitmq e o RABBITMQ_MNESIA_BASE: filas, exchanges e mensagens moram
-          # aqui. Sem fsGroup de proposito -- o container roda como root (uid 0).
+            # Sem isto o nome do no e derivado do nome do POD (rabbit@rabbitmq-<hash>-<id>): ao recriar
+            # o pod o broker inicia um no novo e "perde" as definicoes, mesmo com o volume intacto
+            # (o mnesia fica em /var/lib/rabbitmq/mnesia/rabbit@<nome-do-no>). Nome fixo mantem o
+            # diretorio estavel entre recriacoes. No unico com distribuicao em loopback: os clientes
+            # falam AMQP pelo Service, nao pelo nome de no.
+            - name: RABBITMQ_NODENAME
+              value: "rabbit@localhost"
+          # Estado do broker em volume: o mnesia/ abaixo de /var/lib/rabbitmq (o RABBITMQ_MNESIA_BASE).
+          # Sem fsGroup de proposito -- o entrypoint inicia como root, faz o chown do diretorio para
+          # o usuario rabbitmq e so entao desce privilegio com gosu.
           volumeMounts:
             - name: data
               mountPath: /var/lib/rabbitmq

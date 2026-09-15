@@ -256,7 +256,7 @@ Como o Kong publica apenas a porta `8000`, o `port-forward` do proxy não confli
 kubectl get pods
 kubectl get services
 kubectl get svc users-api catalog-api kong prometheus grafana
-kubectl get pvc prometheus-data
+kubectl get pvc
 ```
 
 Todos os pods devem estar com status `Running` — o do Kong só fica `Ready` depois de o script acima criar o `Secret kong-declarative-config`, e o **do Grafana** só sobe depois do `Secret grafana-admin` (ele é o único que referencia o Secret; se o pod do **Prometheus** não subir, a causa é outra — PVC/StorageClass ou imagem — ver [Observabilidade](#observabilidade)).
@@ -394,7 +394,7 @@ kubectl delete secret sqlserver-secret users-api-secret catalog-api-secret payme
 Remove-Item .env
 ```
 
-> `kubectl delete -f k8s/` também remove o PVC `prometheus-data`: o histórico coletado pelo Prometheus vai junto (a retenção de 7 dias é descartada).
+> `kubectl delete -f k8s/` também remove os **três PVCs de estado** do cluster — `prometheus-data`, `sqlserver-data` e `rabbitmq-data` —, e o que eles guardam **não** volta do mesmo jeito: o Prometheus apenas recomeça a raspar do zero (perde os 7 dias de histórico), mas o **banco** (usuários, catálogo e biblioteca) e as **filas `notifications-*`**, das quais o KEDA depende para escalar a função, não se reconstroem — as filas do Terraform só voltam com o `terraform apply` do repositório da função, e o dado não volta de forma alguma. Use este comando quando a intenção for mesmo começar do zero; para derrubar só os workloads, escale os Deployments para `0` réplicas em vez de apagar o diretório inteiro.
 
 ## API Gateway (Kong)
 
@@ -609,25 +609,32 @@ A regra adotada é a mesma que o `prometheus-data` já seguia: **dado que precis
 | Serviço | PVC | Montado em | Por quê |
 |---|---|---|---|
 | SQL Server | `sqlserver-data` (1Gi, `standard`) | `/var/opt/mssql` | Banco dos usuários, do catálogo e da biblioteca. O pod traz `securityContext.fsGroup: 10001` porque a imagem do `mssql` roda como **uid 10001 (`mssql`)** — sem o `fsGroup` o volume novo vem `root` e o SQL Server **não sobe** |
-| RabbitMQ | `rabbitmq-data` (1Gi, `standard`) | `/var/lib/rabbitmq` | É o `RABBITMQ_MNESIA_BASE` do broker: filas, exchanges e mensagens moram aí, e é uma dessas filas que o KEDA observa para escalar a função. **Sem** `securityContext` de propósito: medido em runtime, o container roda como **root (uid 0)** e não tem problema de permissão no volume novo |
+| RabbitMQ | `rabbitmq-data` (1Gi, `standard`) | `/var/lib/rabbitmq`, com o mnesia em `mnesia/` logo abaixo | Filas, exchanges e mensagens moram aí, e é uma dessas filas que o KEDA observa para escalar a função. **Sem** `securityContext` de propósito: o entrypoint do container inicia como root, faz o `chown` do diretório para o usuário `rabbitmq` e só então desce privilégio com `gosu` — quem escreve no volume é o processo `rabbitmq` (uid 999), e é esse `chown` que torna o volume novo utilizável. **Além do PVC, este serviço precisa do nome de nó fixo** — ver abaixo |
 | MongoDB | `mongo-data` (1Gi, `standard`) | `/data/db` | Avaliações dos jogos (detalhes na tabela acima) |
 
 - **O `prometheus-data` já era assim** desde a stack de observabilidade: o TSDB fica em PVC de 2Gi e a retenção de 7 dias sobrevive ao pod ([Observabilidade](#observabilidade)). Os dois PVCs novos seguem exatamente o mesmo formato — `ReadWriteOnce`, `storageClassName: standard` e rótulo `app` igual ao do workload —, então a StorageClass `standard` continua sendo pré-requisito: sem ela o PVC fica `Pending`.
-- **Loki e Redis seguem sem volume, de propósito.** Os dois são `emptyDir`: no Redis a fonte de verdade é o SQL ([Por que Redis (cache do catálogo)](#por-que-redis-cache-do-catálogo)) e no Loki a retenção é de 24h ([Logs (Loki)](#logs-loki)). A diferença em relação aos três acima não é o descuido, é o conteúdo: o que Loki e Redis guardam **pode** ser reconstruído (ou simplesmente perdido) sem afetar cadastro, catálogo ou o disparo da função.
+- **Loki e Redis seguem sem volume, de propósito.** O Loki usa `emptyDir`, e o Redis **não declara volume nenhum** — o cache (e o `dump.rdb`, se algum dia for gerado) vive no filesystem efêmero do container. Nos dois a fonte de verdade é outra: no Redis é o SQL ([Por que Redis (cache do catálogo)](#por-que-redis-cache-do-catálogo)) e no Loki a retenção é de 24h ([Logs (Loki)](#logs-loki)). A diferença em relação aos três acima não é o descuido, é o conteúdo: o que Loki e Redis guardam **pode** ser reconstruído (ou simplesmente perdido) sem afetar cadastro, catálogo ou o disparo da função.
 - **Os dois Deployments novos usam `strategy: Recreate`**, como o do Mongo e o do Prometheus: o PVC é `ReadWriteOnce`, então num rolling update o pod novo ficaria preso esperando o volume que o antigo ainda usa e o rollout nunca terminaria.
+
+**No RabbitMQ o PVC, sozinho, não bastou — o nome do nó é derivado do nome do pod.** A verificação de runtime desta task aplicou o PVC, apagou o pod e encontrou o dado **no volume** com as filas **sumidas**: `ls -1 /var/lib/rabbitmq/mnesia` listava duas pastas — `rabbit@rabbitmq-669fbb8585-7gs2m` (**268K**, o pod anterior, com o dado dentro) e `rabbit@rabbitmq-669fbb8585-cjzwm` (240K, o pod novo) —, e `rabbitmqctl eval 'node().'` respondia `'rabbit@rabbitmq-669fbb8585-cjzwm'`. O RabbitMQ deriva o nome do nó do **hostname do pod** e procura o mnesia em `mnesia/rabbit@<nome-do-nó>`: pod recriado, nome novo, nó novo e vazio — com as definições intactas **ao lado**, num diretório que ninguém lê. O SQL Server não sofre disso porque guarda por **caminho**, não por identidade. A correção está no `env` do container, junto das credenciais: `RABBITMQ_NODENAME: rabbit@localhost` fixa `mnesia/rabbit@localhost` e mantém o diretório estável entre recriações.
+
+- **Por que `rabbit@localhost` e não `rabbit@rabbitmq`:** com o nome do Service, o Erlang tentaria ligar a distribuição ao **IP do Service**, que não é um endereço local do pod; `localhost` sempre resolve. O nó fica isolado em loopback — exatamente o caso aqui (1 réplica, PVC `ReadWriteOnce`) — e os clientes continuam falando AMQP pelo Service, não pelo nome de nó.
+- **Recriar o pod agora preserva as filas.** É esta a prova do Step 9: `kubectl delete pod -l app=rabbitmq`, `kubectl rollout status deployment/rabbitmq`, e as três filas `notifications-*` seguem em `rabbitmqctl list_queues`, com o `ScaledObject` em `Ready=True`.
+- **Duas observações medidas no primeiro apply, nenhuma delas defeito:** (a) no **primeiro boot com volume novo** o broker reiniciou uma vez com `Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces` — corrida do entrypoint, que cria o cookie antes de o `chown` alcançá-lo — e subiu no boot seguinte, sem intervenção; (b) num volume **novo** — e também na **primeira subida depois desta correção**, porque o diretório do mnesia muda de `rabbit@<nome-do-pod>` para `rabbit@localhost` — as definições declaradas pelo Terraform **não** existem: elas voltam com o `terraform apply` do repositório da função (o que o controlador faz no Step 8), enquanto as do MassTransit voltam sozinhas quando as três APIs reconectam. A partir daí o nome do nó é estável e as filas sobrevivem à recriação do pod. (As pastas antigas `mnesia/rabbit@rabbitmq-<hash>-<id>` ficam no volume como peso morto: não atrapalham, mas podem ser removidas à mão.)
 
 Conferindo os quatro PVCs e quem monta cada um:
 
 ```bash
 kubectl get pvc
 kubectl get deployment sqlserver rabbitmq -o custom-columns=NAME:.metadata.name,STRATEGY:.spec.strategy.type
-kubectl exec deploy/sqlserver -- id   # uid=10001(mssql): e o fsGroup faz o volume novo pertencer a ele
-kubectl exec deploy/rabbitmq -- id    # uid=0(root): por isso o broker nao precisa de fsGroup
+kubectl exec deploy/sqlserver -- id                          # uid=10001(mssql): e o fsGroup faz o volume novo pertencer a ele
+kubectl exec deploy/rabbitmq -- id                           # uid=0(root): e o entrypoint, como root, que faz o chown do volume
+kubectl exec deploy/rabbitmq -- rabbitmqctl eval 'node().'   # 'rabbit@localhost': o nome do no nao muda de pod para pod
 ```
 
 Esperado: `mongo-data`, `sqlserver-data`, `rabbitmq-data` e `prometheus-data` em `Bound`, e `Recreate` nos dois Deployments novos.
 
-A prova de que a persistência vale é **apagar o pod**, não apenas reiniciar o processo. Depois de `kubectl delete pod -l app=sqlserver` e do rollout concluído, o login de um usuário que já existia antes do delete continua respondendo **`200`** — antes desta correção, o mesmo teste devolvia **`400`**, com `{"mensagem":"Usuário não encontrado."}`. Depois de `kubectl delete pod -l app=rabbitmq`, o `rabbitmqctl list_queues name messages` continua listando as três filas `notifications-*` e o `ScaledObject` segue `Ready=True` (antes, as filas `notifications-*` sumiam e o KEDA caía em `TriggerError`).
+A prova de que a persistência vale é **apagar o pod**, não apenas reiniciar o processo — e no RabbitMQ ela só vale porque o nome do nó foi fixado: sem `RABBITMQ_NODENAME`, o pod novo monta o mesmo volume e ainda assim começa vazio (ver acima). Depois de `kubectl delete pod -l app=sqlserver` e do rollout concluído, o login de um usuário que já existia antes do delete continua respondendo **`200`** — antes desta correção, o mesmo teste devolvia **`400`**, com `{"mensagem":"Usuário não encontrado."}`. Depois de `kubectl delete pod -l app=rabbitmq`, o `rabbitmqctl list_queues name messages` continua listando as três filas `notifications-*` e o `ScaledObject` segue `Ready=True` (antes, as filas `notifications-*` sumiam e o KEDA caía em `TriggerError`).
 
 ### Por que MongoDB (avaliações)
 
